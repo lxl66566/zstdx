@@ -25,7 +25,6 @@ use super::{
     seq_codes::{LL_META, ML_META, encode_literal_length, encode_match_len},
     util::first_diff_byte,
 };
-use crate::decoding::sequence_execution::do_offset_history;
 
 /// Prices are fixed-point with 1/256-bit resolution (BITCOST_ACCURACY = 8).
 const BITCOST_MULTIPLIER: u32 = 256;
@@ -121,14 +120,24 @@ fn frac_weight(raw: u32) -> u32 {
 }
 
 /// `ZSTD_newRep`: repcode history after one sequence with wire offset
-/// `off_base` and `ll0` literal-length-zero flag.
+/// `off_base` and `ll0` literal-length-zero flag. A real offset rotates
+/// the cache with the used distance at the front; a repcode re-indexes by
+/// `off_base - 1 + ll0` — index 0 re-uses rep0 and keeps the cache, 1
+/// pulls rep1 to the front, 2 rotates rep2 in, and 3 re-uses rep0 - 1
+/// (the parser only proposes that one once the distance verifies as
+/// nonzero; the saturate keeps the decoder-grade total order).
 #[inline]
 fn new_rep(rep: &[u32; 3], off_base: u32, ll0: bool) -> [u32; 3] {
-    let mut out = *rep;
-    // The history helper takes the literal length; a zero length encodes the
-    // ll0 case, so flip the flag into a length of 0 or 1.
-    do_offset_history(off_base, (!ll0) as u32, &mut out);
-    out
+    let [s0, s1, s2] = *rep;
+    if off_base > 3 {
+        return [off_base - 3, s0, s1];
+    }
+    match off_base - 1 + ll0 as u32 {
+        0 => [s0, s1, s2],
+        1 => [s1, s0, s2],
+        2 => [s2, s0, s1],
+        _ => [s0.saturating_sub(1), s0, s1],
+    }
 }
 
 /// One candidate match: wire offset (repcodes 1..=3, literal offset + 3) and
@@ -402,10 +411,19 @@ fn weights_bulk<const ULTRA: bool>(stats: &[u32], out: &mut [u32]) {
     }
 }
 
+/// Incremental literal-length price: price(lit_length) minus
+/// price(lit_length - 1), wrapped mod 2^32. The increment is 0 within an
+/// ll code band and can go negative only across a band crossing (a
+/// longer band with a lower price). The wrapped value keeps the DP's
+/// u32 wrapping sums exact; the fix block's i32 compares fold the sign
+/// back because every total lives inside (-2^31, 2^31) — prices are
+/// bitcost units below 2^16, and the only larger term is the MAX_PRICE
+/// marker at 2^30.
 #[inline]
-fn ll_inc_price<const ULTRA: bool>(state: &OptState, lit_length: u32) -> i64 {
-    state.lit_length_price::<ULTRA>(lit_length) as i64
-        - state.lit_length_price::<ULTRA>(lit_length - 1) as i64
+fn ll_inc_price<const ULTRA: bool>(state: &OptState, lit_length: u32) -> u32 {
+    state
+        .lit_length_price::<ULTRA>(lit_length)
+        .wrapping_sub(state.lit_length_price::<ULTRA>(lit_length - 1))
 }
 
 impl OptState {
@@ -626,21 +644,47 @@ impl OptState {
         self.ll_price[code as usize & 63].wrapping_add(self.lit_length_base_price)
     }
 
-    /// Price of the match half of a sequence (`ZSTD_getMatchPrice`).
+    /// Price of the match half of a sequence (`ZSTD_getMatchPrice`), split
+    /// so a match's mlen variant scans pay the offset half once: the
+    /// off-base code (`off_base.ilog2()`) and the offset/ML base prices
+    /// are invariant across every variant of one match. The split's
+    /// wrapping adds commute mod 2^32, so it sums to the unsplit price
+    /// bit for bit.
     #[inline]
     fn match_price<const ULTRA: bool>(&self, off_base: u32, match_length: u32) -> u32 {
+        self.match_price_off_term::<ULTRA>(off_base)
+            .wrapping_add(self.match_price_len_term::<ULTRA>(match_length))
+    }
+
+    /// `ZSTD_getMatchPrice`'s offset half: the offset code's price plus the
+    /// offset and match-length base prices (predef: the offset code's
+    /// fixed bit cost).
+    #[inline]
+    fn match_price_off_term<const ULTRA: bool>(&self, off_base: u32) -> u32 {
         let off_code = off_base.ilog2();
         if self.predef {
-            return weight::<ULTRA>(match_length - 3) + (16 + off_code) * BITCOST_MULTIPLIER;
+            return (16 + off_code) * BITCOST_MULTIPLIER;
         }
-        // The mirrors carry the per-code weights with the non-ultra
-        // long-offset handicap and the match surcharge folded in; the
-        // masks are no-ops in range and kill the bounds checks.
-        let (ml_code, ..) = encode_match_len(match_length);
+        // The mirror carries the per-code weight with the non-ultra
+        // long-offset handicap folded in; the mask is a no-op in range
+        // and kills the bounds check.
         self.off_price[off_code as usize & 31]
             .wrapping_add(self.off_code_base_price)
-            .wrapping_add(self.ml_price[ml_code as usize & 127])
             .wrapping_add(self.match_length_base_price)
+    }
+
+    /// `ZSTD_getMatchPrice`'s length half: the ML code's price (predef: the
+    /// fractional weight of the length itself).
+    #[inline]
+    fn match_price_len_term<const ULTRA: bool>(&self, match_length: u32) -> u32 {
+        if self.predef {
+            return weight::<ULTRA>(match_length - 3);
+        }
+        // The mirror carries the per-code weight with the match surcharge
+        // folded in; the mask is a no-op in range and kills the bounds
+        // check.
+        let (ml_code, ..) = encode_match_len(match_length);
+        self.ml_price[ml_code as usize & 127]
     }
 }
 
@@ -1867,6 +1911,12 @@ fn run_once<const ULTRA: bool>(
     let mut anchor = block_start;
     let opt = &mut scratch.opt[..];
     let matches = &mut scratch.matches[..];
+    // Debug pins for the DP core's unchecked accesses: the scratch slices
+    // carry their full OPT_SIZE geometry and the window covers the whole
+    // block (the caller's contract).
+    debug_assert_eq!(opt.len(), OPT_SIZE);
+    debug_assert_eq!(matches.len(), OPT_SIZE);
+    debug_assert!(block_end_idx <= win.len());
     let sufficient_len = knobs.sufficient_len as usize;
     let min_match = knobs.min_match as usize;
     let mut ldm = LdmCursor::new(ldm_seqs);
@@ -1921,169 +1971,227 @@ fn run_once<const ULTRA: bool>(
             cur = 0;
             last_pos = max_ml;
         } else {
-            // Price the first match's coverage span.
-            let mut pos_i = 1usize;
-            while pos_i < min_match {
-                opt[pos_i].price = MAX_PRICE;
-                opt[pos_i].mlen = 0;
-                opt[pos_i].litlen = litlen + pos_i as u32;
-                pos_i += 1;
-            }
-            for &cand in &matches[..nb] {
-                let off = cand.off;
-                let end = cand.len as usize;
-                while pos_i <= end {
-                    let price = opt[0].price + state.match_price::<ULTRA>(off, pos_i as u32);
-                    opt[pos_i] = Optimal {
-                        price: price + state.lit_length_price::<ULTRA>(0),
-                        off,
-                        mlen: pos_i as u32,
-                        litlen: 0,
-                        rep: [1, 4, 8],
-                    };
+            // Price the first match's coverage span. The ll-0 price is a
+            // series invariant (the statistics only move at emission).
+            let ll0_price = state.lit_length_price::<ULTRA>(0);
+            let opt0_price = opt[0].price;
+            // SAFETY: the scan's opt indices stay below OPT_SIZE: the
+            // markers stop below min_match, the scan stops at max_ml,
+            // which is <= sufficient_len < OPT_NUM here (the jump branch
+            // above took anything longer), and the sentinel lands one
+            // past that.
+            unsafe {
+                let mut pos_i = 1usize;
+                while pos_i < min_match {
+                    let e = opt.get_unchecked_mut(pos_i);
+                    e.price = MAX_PRICE;
+                    e.mlen = 0;
+                    e.litlen = litlen + pos_i as u32;
                     pos_i += 1;
                 }
+                for &cand in &matches[..nb] {
+                    let off = cand.off;
+                    let end = cand.len as usize;
+                    let off_term = state.match_price_off_term::<ULTRA>(off);
+                    while pos_i <= end {
+                        let price = opt0_price
+                            .wrapping_add(off_term)
+                            .wrapping_add(state.match_price_len_term::<ULTRA>(pos_i as u32))
+                            .wrapping_add(ll0_price);
+                        // Live fields only. The rep the full write would
+                        // store is dead: every entry this scan writes has
+                        // litlen 0, and the match-end history step rewrites
+                        // such an entry's rep at its own iteration, before
+                        // any rep consumer (the position's search, the rep
+                        // chains behind it); the shortest-path stores copy
+                        // entries whole but nothing downstream reads the
+                        // stored rep.
+                        let e = opt.get_unchecked_mut(pos_i);
+                        e.price = price;
+                        e.off = off;
+                        e.mlen = pos_i as u32;
+                        e.litlen = 0;
+                        pos_i += 1;
+                    }
+                }
+                last_pos = pos_i - 1;
+                opt.get_unchecked_mut(pos_i).price = MAX_PRICE;
             }
-            last_pos = pos_i - 1;
-            opt[pos_i].price = MAX_PRICE;
 
             // Extend the DP across further positions.
             cur = 1;
             while cur <= last_pos {
-                let idx_cur = idx + cur;
+                // SAFETY: unchecked opt/matches/window accesses only.
+                // - opt: `cur` runs in 1..=last_pos and every index the block derives stays below
+                //   OPT_SIZE. The jump branch takes `cur + longest >= OPT_NUM`, so the variant
+                //   scan's `pos2` stays below OPT_NUM, and the recheck's `cur + 1` re-arms last_pos
+                //   only below that bound. The `prev` indices subtract a match length (>= min_match
+                //   >= 3) from a position an entry with litlen 0 occupies, so those sit at or above
+                //   min_match and never below 0.
+                // - matches: nb/nb2 are the writers' counts (the tree search stores strictly
+                //   increasing lengths and the LDM cursor admits nothing past OPT_NUM), so every
+                //   match index is below the array.
+                // - win: every DP position keeps pos + cur <= block_end (the stored lengths cap at
+                //   the block end, and the variant/recheck guards keep their extensions inside it),
+                //   so the literal reads stay at or below the block's last byte.
+                unsafe {
+                    let idx_cur = idx + cur;
 
-                // Fix the current position with one literal if cheaper.
-                {
-                    let litlen_l = opt[cur - 1].litlen + 1;
-                    let price = opt[cur - 1].price as i64
-                        + state.lit_price::<ULTRA>(win[idx_cur - 1]) as i64
-                        + ll_inc_price::<ULTRA>(state, litlen_l);
-                    if price <= opt[cur].price as i64 {
-                        let prev_match = opt[cur];
-                        opt[cur] = opt[cur - 1];
-                        opt[cur].litlen = litlen_l;
-                        opt[cur].price = price as u32;
-                        // btultra: a match ending right here followed by one
-                        // literal can beat the all-literal path. C's guard is
-                        // `ip + cur < iend` (the priced literal must be in
-                        // the block); the port's `+1` dropped the boundary
-                        // case where that literal is the block's last byte.
-                        if ULTRA
-                            && prev_match.litlen == 0
-                            && ll_inc_price::<ULTRA>(state, 1) < 0
-                            && pos + (cur as u64) < block_end
-                        {
-                            let with1 = prev_match.price as i64
-                                + state.lit_price::<ULTRA>(win[idx_cur]) as i64
-                                + ll_inc_price::<ULTRA>(state, 1);
-                            let with_more = price
-                                + state.lit_price::<ULTRA>(win[idx_cur]) as i64
-                                + ll_inc_price::<ULTRA>(state, litlen_l + 1);
-                            if with1 < with_more && (with1 as u32) < opt[cur + 1].price {
-                                let prev = cur - prev_match.mlen as usize;
-                                let reps =
-                                    new_rep(&opt[prev].rep, prev_match.off, opt[prev].litlen == 0);
-                                opt[cur + 1] = prev_match;
-                                opt[cur + 1].rep = reps;
-                                opt[cur + 1].litlen = 1;
-                                opt[cur + 1].price = with1 as u32;
-                                if last_pos < cur + 1 {
-                                    last_pos = cur + 1;
+                    // Fix the current position with one literal if cheaper.
+                    {
+                        let prev = *opt.get_unchecked(cur - 1);
+                        let litlen_l = prev.litlen + 1;
+                        let price = prev
+                            .price
+                            .wrapping_add(state.lit_price::<ULTRA>(*win.get_unchecked(idx_cur - 1)))
+                            .wrapping_add(ll_inc_price::<ULTRA>(state, litlen_l));
+                        if price as i32 <= opt.get_unchecked(cur).price as i32 {
+                            let prev_match = *opt.get_unchecked(cur);
+                            *opt.get_unchecked_mut(cur) = prev;
+                            let e = opt.get_unchecked_mut(cur);
+                            e.litlen = litlen_l;
+                            e.price = price;
+                            // btultra: a match ending right here followed by one
+                            // literal can beat the all-literal path. C's guard is
+                            // `ip + cur < iend` (the priced literal must be in
+                            // the block); the port's `+1` dropped the boundary
+                            // case where that literal is the block's last byte.
+                            if ULTRA
+                                && prev_match.litlen == 0
+                                && (ll_inc_price::<ULTRA>(state, 1) as i32) < 0
+                                && pos + (cur as u64) < block_end
+                            {
+                                let lit_cur = state.lit_price::<ULTRA>(*win.get_unchecked(idx_cur));
+                                let with1 = prev_match
+                                    .price
+                                    .wrapping_add(lit_cur)
+                                    .wrapping_add(ll_inc_price::<ULTRA>(state, 1));
+                                let with_more = price
+                                    .wrapping_add(lit_cur)
+                                    .wrapping_add(ll_inc_price::<ULTRA>(state, litlen_l + 1));
+                                if (with1 as i32) < (with_more as i32)
+                                    && with1 < opt.get_unchecked(cur + 1).price
+                                {
+                                    let prev_pos = cur - prev_match.mlen as usize;
+                                    let prev2 = *opt.get_unchecked(prev_pos);
+                                    let reps =
+                                        new_rep(&prev2.rep, prev_match.off, prev2.litlen == 0);
+                                    *opt.get_unchecked_mut(cur + 1) = prev_match;
+                                    let e = opt.get_unchecked_mut(cur + 1);
+                                    e.rep = reps;
+                                    e.litlen = 1;
+                                    e.price = with1;
+                                    if last_pos < cur + 1 {
+                                        last_pos = cur + 1;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // A stretch ending on a match rewrites the offset history.
-                if opt[cur].litlen == 0 {
-                    let prev = cur - opt[cur].mlen as usize;
-                    opt[cur].rep = new_rep(&opt[prev].rep, opt[cur].off, opt[prev].litlen == 0);
-                }
-
-                if idx_cur > ilimit_idx {
-                    cur += 1;
-                    continue;
-                }
-                if cur == last_pos {
-                    break;
-                }
-                // btopt: skip positions the next entry already beats.
-                if !ULTRA && opt[cur + 1].price <= opt[cur].price + BITCOST_MULTIPLIER / 2 {
-                    cur += 1;
-                    continue;
-                }
-
-                let ll0c = (opt[cur].litlen == 0) as u32;
-                let base_price = opt[cur].price + state.lit_length_price::<ULTRA>(0);
-                // idx_cur <= ilimit_idx keeps the search 8 bytes inside the
-                // block end.
-                let mut nb2 = if pos + (cur as u64) < *finder.next_update {
-                    0
-                } else {
-                    finder.update_tree(idx_cur);
-                    finder.get_all_matches(
-                        matches,
-                        idx_cur,
-                        &opt[cur].rep,
-                        ll0c,
-                        min_match,
-                        &mut next_update3,
-                        *rep_pending != 0,
-                    )
-                };
-                ldm_won |= ldm.add(matches, &mut nb2, pos + cur as u64, knobs.min_match);
-                if nb2 == 0 {
-                    cur += 1;
-                    continue;
-                }
-                let longest = matches[nb2 - 1].len as usize;
-                if longest > sufficient_len
-                    || cur + longest >= OPT_NUM
-                    || pos + (cur + longest) as u64 >= block_end
-                {
-                    last_stretch.litlen = 0;
-                    last_stretch.mlen = longest as u32;
-                    last_stretch.off = matches[nb2 - 1].off;
-                    last_pos = cur + longest;
-                    jumped = true;
-                    break;
-                }
-
-                for m in 0..nb2 {
-                    let off = matches[m].off;
-                    let last_ml = matches[m].len as usize;
-                    let start_ml = if m > 0 {
-                        matches[m - 1].len as usize + 1
-                    } else {
-                        min_match
-                    };
-                    let mut mlen = last_ml;
-                    while mlen >= start_ml {
-                        let pos2 = cur + mlen;
-                        let price = base_price + state.match_price::<ULTRA>(off, mlen as u32);
-                        if pos2 > last_pos || price < opt[pos2].price {
-                            while last_pos < pos2 {
-                                last_pos += 1;
-                                opt[last_pos].price = MAX_PRICE;
-                                opt[last_pos].litlen = 1;
-                            }
-                            opt[pos2] = Optimal {
-                                price,
-                                off,
-                                mlen: mlen as u32,
-                                litlen: 0,
-                                rep: [1, 4, 8],
-                            };
-                        } else if !ULTRA {
-                            // btopt early abort: longer variants of this match
-                            // cannot win either.
-                            break;
-                        }
-                        mlen -= 1;
+                    // A stretch ending on a match rewrites the offset history.
+                    if opt.get_unchecked(cur).litlen == 0 {
+                        let cur_e = *opt.get_unchecked(cur);
+                        let prev_pos = cur - cur_e.mlen as usize;
+                        let prev_e = *opt.get_unchecked(prev_pos);
+                        opt.get_unchecked_mut(cur).rep =
+                            new_rep(&prev_e.rep, cur_e.off, prev_e.litlen == 0);
                     }
+
+                    if idx_cur > ilimit_idx {
+                        cur += 1;
+                        continue;
+                    }
+                    if cur == last_pos {
+                        break;
+                    }
+                    // btopt: skip positions the next entry already beats.
+                    if !ULTRA
+                        && opt.get_unchecked(cur + 1).price
+                            <= opt.get_unchecked(cur).price + BITCOST_MULTIPLIER / 2
+                    {
+                        cur += 1;
+                        continue;
+                    }
+
+                    let cur_e = *opt.get_unchecked(cur);
+                    let ll0c = (cur_e.litlen == 0) as u32;
+                    let base_price = cur_e.price + ll0_price;
+                    // idx_cur <= ilimit_idx keeps the search 8 bytes inside the
+                    // block end.
+                    let mut nb2 = if pos + (cur as u64) < *finder.next_update {
+                        0
+                    } else {
+                        finder.update_tree(idx_cur);
+                        finder.get_all_matches(
+                            matches,
+                            idx_cur,
+                            &cur_e.rep,
+                            ll0c,
+                            min_match,
+                            &mut next_update3,
+                            *rep_pending != 0,
+                        )
+                    };
+                    ldm_won |= ldm.add(matches, &mut nb2, pos + cur as u64, knobs.min_match);
+                    if nb2 == 0 {
+                        cur += 1;
+                        continue;
+                    }
+                    let best = *matches.get_unchecked(nb2 - 1);
+                    let longest = best.len as usize;
+                    if longest > sufficient_len
+                        || cur + longest >= OPT_NUM
+                        || pos + (cur + longest) as u64 >= block_end
+                    {
+                        last_stretch.litlen = 0;
+                        last_stretch.mlen = longest as u32;
+                        last_stretch.off = best.off;
+                        last_pos = cur + longest;
+                        jumped = true;
+                        break;
+                    }
+
+                    for m in 0..nb2 {
+                        let m_e = *matches.get_unchecked(m);
+                        let off = m_e.off;
+                        let last_ml = m_e.len as usize;
+                        let start_ml = if m > 0 {
+                            matches.get_unchecked(m - 1).len as usize + 1
+                        } else {
+                            min_match
+                        };
+                        let off_term = state.match_price_off_term::<ULTRA>(off);
+                        let mut mlen = last_ml;
+                        while mlen >= start_ml {
+                            let pos2 = cur + mlen;
+                            let price = base_price
+                                .wrapping_add(off_term)
+                                .wrapping_add(state.match_price_len_term::<ULTRA>(mlen as u32));
+                            if pos2 > last_pos || price < opt.get_unchecked(pos2).price {
+                                while last_pos < pos2 {
+                                    last_pos += 1;
+                                    let e = opt.get_unchecked_mut(last_pos);
+                                    e.price = MAX_PRICE;
+                                    e.litlen = 1;
+                                }
+                                // Live fields only; the rep placeholder is
+                                // dead (see the coverage scan).
+                                let e = opt.get_unchecked_mut(pos2);
+                                e.price = price;
+                                e.off = off;
+                                e.mlen = mlen as u32;
+                                e.litlen = 0;
+                            } else if !ULTRA {
+                                // btopt early abort: longer variants of this match
+                                // cannot win either.
+                                break;
+                            }
+                            mlen -= 1;
+                        }
+                    }
+                    opt.get_unchecked_mut(last_pos + 1).price = MAX_PRICE;
                 }
-                opt[last_pos + 1].price = MAX_PRICE;
                 cur += 1;
             }
             if !jumped {

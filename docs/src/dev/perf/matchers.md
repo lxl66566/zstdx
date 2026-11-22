@@ -585,6 +585,21 @@ Both walks then took the dubt.rs raw-pointer discipline, the tier's last checked
 The count kernel's switch-point dispatch dropped its OnceLock fast path (two branches plus the relaxed load per call) for a plain AtomicUsize function-pointer cell read with one relaxed load and filled by the same cold selector on first use, halving the cost of the long-compare walks' rare 64 B-crossing compares. Ir is noise-level everywhere on the corpus (the gate is only reached by compares still running at 64 B).
 
 Gates per commit: full-ladder bulk and stream dumps byte-identical against main, the paranoid suite green, and the negative results (the fused-admission form, the insert-side hoist) recorded here rather than in [negative](negative/matchers.md) because they are placement refusals of otherwise-sound arithmetic.
+### The DP core diet
+
+The DP parse loop is the second-biggest l19 lump after the tree search (profiled at 21.2% of json cycles, 41.8% of text and 12.1% of skewed), and five per-position overheads landed as five commits, each byte-identical by construction and gated per commit on the full-ladder bulk and streaming dumps plus the paranoid suite. The per-commit gungraun Ir against main at the ultra tier, cumulative:
+
+| commit | json | text | skewed | dll |
+|---|---|---|---|---|
+| hoist the match-invariant price terms out of the mlen scans | -4.01% | -6.75% | -2.00% | -3.67% |
+| write only the live fields of DP variant entries | -4.04% | -6.80% | -2.07% | -3.74% |
+| strip the bounds checks from the DP core | -3.97% | -8.02% | -0.98% | -3.95% |
+| run the literal-fix sums in u32 wrapping arithmetic | -4.21% | -8.31% | -1.11% | -4.23% |
+| rotate the repcode history in new_rep directly | -4.57% | -8.97% | -1.11% | -4.90% |
+
+The hoist split `match_price` into an offset half (`off_base.ilog2()`, the offset-code mirror read, the offset and ML base prices — all invariant across one match's length variants) and a length half, so the variant loops pay the offset half once per match instead of once per enumerated mlen, and the ll-0 price left the per-position block as a series invariant. The split sums bit for bit because the adds wrap mod 2^32. The entry slim writes the four live fields instead of a 28-byte struct whose `rep: [1, 4, 8]` placeholder is dead: a `litlen == 0` entry's rep is rewritten by the match-end history step at its own iteration, before any rep consumer, and nothing downstream reads the rep a shortest-path store copies. The unchecked pass carries the proofs as debug pins (scratch geometry, `cur + longest < OPT_NUM` from the jump guards, the literal reads at or below the block's last byte); it cost +1.1% Ir on skewed relative to its predecessor — a placement effect, the numbers only ever validated hunk by hunk — and still nets the row ahead of main. The u32 pass folds `ll_inc_price`'s sign at i32 compares (every total lives inside (-2^31, 2^31); bitcost prices below 2^16, the MAX_PRICE marker at 2^30 the largest term), keeping the fix block's sums in one register width. The `new_rep` pass replaced the decoder's select-chain `do_offset_history` with the encoder's plain three-branch rotation, saturating the rep0-minus-1 case.
+
+Wall l19 serial medians (x, interleaved A/B against libzstd, `--parallel 1`): json 1.037 to 0.998 and text 0.603 to 0.580, both at the Ir-derived expectation once the DP's cycle share is applied (text's 41.8% share converts a 9% Ir cut to 4% wall); skewed 0.920 to 0.931 is inside the per-pass noise of ±0.02, consistent with its 12.1% DP share, and the l18 cells read flat to slightly better on all three shapes. The ratio sweep is unchanged by the byte-identity.
 
 ## Level ladder tuning
 
