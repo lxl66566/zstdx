@@ -24,10 +24,11 @@
 //! - `enc-mt` interleaves both sides at equal worker counts with fresh contexts per call (the zstd
 //!   crate has no per-call pool API; a warm reused context is reported once as a reference line).
 //! - `enc-stream` compares the streaming encoders: single-threaded zstdx vs zstd interleaved over
-//!   the selected pull sizes (`--pull`, default 64 KiB; all six ladder tiers), then multithreaded
-//!   (`--mt-workers`, default 8) zstdx vs zstd interleaved at 64 KiB, each followed by our bulk mt
-//!   path over the same bytes as the ceiling reference. Raw `--file` payloads (e.g.
-//!   `bench/big/dll100.raw`) join the ST section.
+//!   the selected pull sizes (`--pull`, default 64 KiB; the six ladder tiers, or every numeric
+//!   level under `--full-ladder`), then multithreaded (`--mt-workers`, default 8) zstdx vs zstd
+//!   interleaved at 64 KiB over the ladder tiers, each followed by our bulk mt path over the same
+//!   bytes as the ceiling reference. Raw `--file` payloads (e.g. `bench/big/dll100.raw`) join the
+//!   ST section. `--no-mt` skips the MT half.
 //! - `enc-feed` reproduces the 7-Zip/FFI caller shape on both sides: write-feed streaming with a
 //!   srcSizeHint, no pledge, 128 KiB continue writes, workers 8/16 (see `t6_enc_feed`). The payload
 //!   set is the mixed corpus cell (json+text+skewed concatenated) plus raw `--file` entries, each
@@ -110,10 +111,16 @@ pub struct Args {
     /// Fixed worker count for the mt and streaming-mt sections
     #[arg(long, default_value_t = 8)]
     pub mt_workers: u32,
-    /// enc-st over every numeric level 1-22, both sides at the same number;
-    /// extremely heavy (release-gate only, never for daily iteration)
+    /// enc-st and the enc-stream ST section over every numeric level 1-22,
+    /// both sides at the same number; extremely heavy (release-gate only,
+    /// never for daily iteration)
     #[arg(long)]
     pub full_ladder: bool,
+    /// Skip the enc-stream MT section: its cells and their bulk-mt ceiling
+    /// lines. The daily enc-stream section already covers the MT tiers, so
+    /// a full-ladder streaming pass measures the ST cells alone
+    #[arg(long)]
+    pub no_mt: bool,
     /// Tile each enc-feed payload N times (default 1): field-scale streams
     /// (hundreds of MB) are what the growing-grid ramp and the reserve
     /// behavior respond to, and a tiled payload carries no new match
@@ -156,9 +163,9 @@ pub struct Args {
     pub budget_ms: Option<f64>,
     /// Maximum cells running at once in the enc-st and enc-stream ST
     /// sections, bounded by a built-in memory budget over the payload
-    /// size; 0 = one per logical core, 1 = the serial behavior of the old
-    /// harness. The default 2 keeps cells within 5 percent of their serial
-    /// x (measured; 3 and 6 distort deep-tier cells). dec-st and the mt
+    /// size; 0 = one per logical core, 1 = serial. The default 2 held
+    /// enc-st json within 5 percent of serial x but moved enc-stream cells
+    /// by up to 0.4 in x, so enc-stream verdicts pass 1. dec-st and the mt
     /// sections never parallelize.
     #[arg(long, default_value_t = DEFAULT_TIMING_WIDTH)]
     pub parallel: usize,
@@ -214,8 +221,9 @@ fn numeric_axis(args: &Args) -> Vec<LevelCell> {
         .collect()
 }
 
-/// The enc-st level axis: numeric 1-22 with `--full-ladder`, the tier
-/// ladder otherwise. The mt/stream sections keep their curated tier subsets.
+/// The enc-st and enc-stream ST level axes: numeric 1-22 with
+/// `--full-ladder`, the tier ladder otherwise. The mt sections and the
+/// enc-stream MT section keep the tier ladder.
 fn enc_axis(args: &Args) -> Vec<LevelCell> {
     if args.full_ladder {
         numeric_axis(args)
@@ -846,17 +854,15 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
     let cells: Vec<(String, usize, _)> = payloads
         .iter()
         .flat_map(|(name, raw)| {
-            ladder_axis(args, &LADDER)
-                .into_iter()
-                .map(move |(label, level, z)| {
-                    let name = name.clone();
-                    let raw = Arc::clone(raw);
-                    let ab = *ab;
-                    let pulls = args.pull.clone();
-                    (format!("{name}.{label}.stream"), raw.len(), move || {
-                        enc_stream_st_cell(&ab, &raw, &name, &label, level, z, &pulls)
-                    })
+            enc_axis(args).into_iter().map(move |(label, level, z)| {
+                let name = name.clone();
+                let raw = Arc::clone(raw);
+                let ab = *ab;
+                let pulls = args.pull.clone();
+                (format!("{name}.{label}.stream"), raw.len(), move || {
+                    enc_stream_st_cell(&ab, &raw, &name, &label, level, z, &pulls)
                 })
+            })
         })
         .collect();
     for lines in run_cells(cells, args.parallel) {
@@ -867,6 +873,9 @@ fn t5_enc_stream(ab: &Ab, args: &Args) {
 
     // multithreaded streaming, both sides (always the default 64 KiB pull;
     // --pull applies to the ST section)
+    if args.no_mt {
+        return;
+    }
     let mt = args.mt_workers;
     println!("== T5b encode streaming MT({mt}), checksums off (interleaved A/B; 64 KiB pulls) ==");
     for (name, raw) in &payloads {

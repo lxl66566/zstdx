@@ -9,15 +9,17 @@
 #
 # Sections default to the daily set: dec-st dec-mt files-dll files-multi
 # enc-st enc-mt8 enc-mt16 enc-stream small ratio. The name "all" replaces
-# the list with the daily set plus the full numeric ladder per shape, the
-# release gate. Each section's output lands in <out>/<section>.log; a
+# the list with the daily set plus the full numeric ladder per shape and
+# the serial streaming ladder over levels 1 to 22, the release gate. Each
+# section's output lands in <out>/<section>.log; a
 # summary table with per-section walls prints at the end. dll100 payloads
 # join automatically when bench/big carries them; generate with
 # bench/gen_big.sh, and the multi-frame payload joins likewise through
 # bench/gen_multiframe.sh.
 #
 # The output directory defaults under bench/scratch/, which is gitignored;
-# pass --out to place it elsewhere.
+# pass --out to place it elsewhere. Logs that back a README figure are
+# copied into bench/data/, which is tracked.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -38,7 +40,7 @@ DAILY=(dec-st dec-mt files-dll files-multi enc-st enc-mt8 enc-mt16 enc-stream sm
 if [ ${#sections[@]} -eq 0 ]; then
     sections=("${DAILY[@]}")
 elif [ "${sections[0]}" = "all" ]; then
-    sections=("${DAILY[@]}" ladder-json ladder-text ladder-skewed ladder-random ladder-zeros)
+    sections=("${DAILY[@]}" ladder-json ladder-text ladder-skewed ladder-random ladder-zeros stream-ladder)
 fi
 
 # payloads outside the corpus join when present
@@ -79,6 +81,8 @@ run_section() {
         small)      "$BIN" small --shape json,text --level 1,3,9 ;;
         ratio)      "$BIN" ratio ;;
         ladder-*)   "$BIN" matrix --mode enc-st --full-ladder --shape "${sec#ladder-}" ;;
+        stream-ladder)
+            "$BIN" matrix --mode enc-stream --full-ladder --no-mt --parallel 1 --shape json,text "${ENC_FILES[@]}" ;;
         *)          echo "unknown section: $sec" >&2; return 1 ;;
     esac >"$stdout" 2>"$stderr"
 }

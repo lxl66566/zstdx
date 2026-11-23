@@ -24,9 +24,10 @@ use rayon::prelude::*;
 /// Default maximum number of timing cells running at once. The 2026-11-01
 /// calibration on enc-st json: width 6 inflated json.balanced x by 9
 /// percent and width 3 read json.ultra at x1.65 against 1.03 serial, while
-/// width 2 held every cell within 5 percent of its serial x, so 2 is the
-/// default ceiling for sections whose x is the verdict. Wider widths stay
-/// available for smoke passes.
+/// width 2 held every cell within 5 percent of its serial x. enc-stream
+/// moves at width 2: on 2026-11-24 it read zstdx's mid cells 14 to 30
+/// percent below serial, so its verdict cells run with `--parallel 1`.
+/// Wider widths stay available for smoke passes.
 pub const DEFAULT_TIMING_WIDTH: usize = 2;
 
 /// Default maximum number of cells running at once for sections whose
