@@ -341,6 +341,16 @@ pub struct MatchGeneratorDriver {
     /// it before the first block parses (see
     /// [`Self::consider_balanced_store`]).
     bal_store: BalancedStore,
+    /// The btlazy2 ladder rows' domain verdict (rows 13-15, see
+    /// [`BtDomain`]): every frame starts at [`BtDomain::Far`], and the
+    /// first matching entry's head sample may flip it to
+    /// [`BtDomain::Near`] (see [`Self::resolve_bt_domain`]). MT jobs and
+    /// dictionary frames never resolve one, so they keep the default
+    /// class and cannot inherit another frame's parse.
+    bt_domain: BtDomain,
+    /// The pending domain verdict, armed by [`Self::apply_level`] on a
+    /// btlazy2 ladder row; taken by the frame's first matching entry.
+    bt_domain_pending: Option<Level>,
     /// LDM arming context (see [`LdmArming`]); applied inside
     /// [`Self::apply_level`]'s size gate, so entry points set it before
     /// `reset`.
@@ -767,6 +777,7 @@ pub(crate) fn dict_seed_key(
         base_row,
         RowAttempts::Stock,
         BalancedStore::Chain,
+        BtDomain::Far,
     );
     match ldm {
         crate::LdmMode::Auto => {},
@@ -791,6 +802,7 @@ pub(crate) fn dict_seed_key(
                     base_row,
                     RowAttempts::Stock,
                     BalancedStore::Chain,
+                    BtDomain::Far,
                 )
                 .window
                 .next_power_of_two();
@@ -1273,6 +1285,8 @@ impl MatchGeneratorDriver {
             small_src_pending: None,
             row_attempts: RowAttempts::Stock,
             bal_store: BalancedStore::Chain,
+            bt_domain: BtDomain::Far,
+            bt_domain_pending: None,
             row_attempts_pending: None,
             slice_size,
             ramp: RampGate::OFF,
@@ -1353,6 +1367,8 @@ impl MatchGeneratorDriver {
             small_src_pending: None,
             row_attempts: RowAttempts::Stock,
             bal_store: BalancedStore::Chain,
+            bt_domain: BtDomain::Far,
+            bt_domain_pending: None,
             row_attempts_pending: None,
             slice_size: 0,
             ramp: RampGate::OFF,
@@ -1536,6 +1552,7 @@ impl MatchGeneratorDriver {
             self.small_src_row,
             self.row_attempts,
             self.bal_store,
+            self.bt_domain,
         );
         // The frame's reach probe result: only a probe-subject row's
         // stock reach is replaceable — never a shape-clamped one, and
@@ -1623,6 +1640,7 @@ impl MatchGeneratorDriver {
                         self.small_src_row,
                         self.row_attempts,
                         self.bal_store,
+                        self.bt_domain,
                     )
                     .window
                     .next_power_of_two();
@@ -1768,6 +1786,17 @@ impl MatchGeneratorDriver {
         self.row_attempts_pending = (self.row_attempts == RowAttempts::Stock
             && matches!(self.params.strategy, Strategy::Row(_)))
         .then_some(level);
+        // A btlazy2 ladder row (13-15) arms the domain verdict — resolved
+        // at the frame's first matching entry from the same head sample
+        // the row-band verdicts read (see [`Self::resolve_bt_domain`]).
+        // Stock-only arming keeps a resolved Near frame from re-arming
+        // across the resolve's own re-apply, and the strategy check keeps
+        // the small-src swap rows (levels 4-10, whose own rows sit below
+        // the change point) out of the substitution.
+        self.bt_domain_pending = (self.bt_domain == BtDomain::Far
+            && (13..=15).contains(&level.as_i32())
+            && matches!(self.params.strategy, Strategy::BtLazy(_)))
+        .then_some(level);
     }
 
     /// Re-derive the per-frame state that keys on the active strategy
@@ -1889,6 +1918,26 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Resolve the pending btlazy2 domain verdict from the frame's head
+    /// (see [`BtDomain`]): a narrow sampled alphabet shrinks the tree
+    /// ring and search domain for the frame. The resolve's re-apply takes
+    /// the `tables_change` path (the ring log is part of the strategy
+    /// payload), and `strategy_phase_reset` re-arms the DUBT-stale clear
+    /// so the resized tables start from the frame's own fill.
+    fn resolve_bt_domain(&mut self) {
+        if let Some(level) = self.bt_domain_pending.take() {
+            let head = window_slice(&self.win, self.ext.as_ref());
+            let span = head.len().min(BT_DOMAIN_HEAD_SPAN);
+            if span > 0 && bt_domain_near(&head[..span]) {
+                self.bt_domain = BtDomain::Near;
+                self.apply_level(level);
+                self.strategy_phase_reset();
+                #[cfg(feature = "cfg_dump")]
+                self.cfg_flip("bt_domain_near");
+            }
+        }
+    }
+
     /// Resolve the balanced row's storage verdict from a head sample the
     /// calling entry point holds (see [`BalancedStore`]): the bulk slice
     /// and pledged stream cores see the frame's head before its first
@@ -1951,9 +2000,12 @@ impl MatchGeneratorDriver {
         // resolution would sample is dictionary content, not the frame's
         // own, so dictionary frames keep R8's swap row at 9/10. The
         // pending attempts verdict dies with it, for the same reason, and
-        // the storage verdict stands down with them.
+        // the storage verdict stands down with them. The pending domain
+        // verdict dies too — a dictionary frame's head is dictionary
+        // content, and the small-dict rows own levels 13-15 there anyway.
         self.small_src_pending = None;
         self.row_attempts_pending = None;
+        self.bt_domain_pending = None;
         self.bal_store = BalancedStore::Chain;
         // The extended class-swap band (5-8, 11-17) stands down here:
         // `small_dict_row`'s band owns these levels on dictionary frames,
@@ -1965,6 +2017,7 @@ impl MatchGeneratorDriver {
             self.strategy_phase_reset();
             self.small_src_pending = None;
             self.row_attempts_pending = None;
+            self.bt_domain_pending = None;
         }
         let dict_len = content.len() as u64;
         let keep = content.len().min(self.params.window);
@@ -3530,6 +3583,11 @@ impl MatchGeneratorDriver {
         self.ldm_seqs.clear();
         self.small_src_pending = None;
         self.row_attempts_pending = None;
+        // Canonical fresh domain (see [`BtDomain`]): dictionary frames
+        // never resolve a domain verdict (`load_dictionary` cancels the
+        // pending, and the small-dict rows own levels 13-15 there).
+        self.bt_domain = BtDomain::Far;
+        self.bt_domain_pending = None;
     }
 }
 
@@ -3689,6 +3747,10 @@ impl Matcher for MatchGeneratorDriver {
         // head sample never resolve one, so they cannot inherit another
         // frame's row parse.
         self.bal_store = BalancedStore::Chain;
+        // Every frame starts at the stock domain class (see [`BtDomain`]);
+        // the verdict is per-frame state, resolved at the first matching
+        // entry like the small-src and attempts verdicts.
+        self.bt_domain = BtDomain::Far;
         self.dict_prefix = false;
         self.opt_strip_top = 0;
         self.opt_strip_base = 0;
@@ -3879,6 +3941,7 @@ impl Matcher for MatchGeneratorDriver {
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         self.resolve_small_src_row();
         self.resolve_row_attempts();
+        self.resolve_bt_domain();
         let mut literals = Vec::new();
         let mut seqs: Vec<SeqWord> = Vec::new();
         self.start_matching_codes(&mut literals, &mut seqs);
@@ -4056,6 +4119,7 @@ impl Matcher for MatchGeneratorDriver {
     fn skip_matching(&mut self) {
         self.resolve_small_src_row();
         self.resolve_row_attempts();
+        self.resolve_bt_domain();
         // Only called for RLE blocks so far: every 5-byte window in a
         // uniform run hashes to the same slot, so indexing each byte just
         // rewrites one table entry. The first position covers that slot;
@@ -4207,6 +4271,7 @@ impl MatchGeneratorDriver {
     fn start_matching_codes_inner(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
         self.resolve_small_src_row();
         self.resolve_row_attempts();
+        self.resolve_bt_domain();
         if self.head_block() {
             // The head parses through the btlazy2 driver; its bytes stay
             // LDM-indexed so later chain blocks can match far into them.
@@ -4862,11 +4927,12 @@ pub(crate) use params::{
     LdmArming, balanced_store,
 };
 use params::{
-    BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
-    HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS, LdmFill, LevelParams,
-    ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SmallDictRow, SmallSrcRow, Strategy,
-    ldm_min_window, params_for, params_for_row, row_attempts_light, sampled_distinct,
-    small_dict_row, small_src_btlazy_head, small_src_class_plain_only, small_src_class_swapped,
+    BT_DENSE_LIMIT, BT_DOMAIN_HEAD_SPAN, BtDomain, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS,
+    HEAD_LIMIT, HEAD_MIN_TOTAL, HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS,
+    LdmFill, LevelParams, ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SmallDictRow,
+    SmallSrcRow, Strategy, bt_domain_near, ldm_min_window, params_for, params_for_row,
+    row_attempts_light, sampled_distinct, small_dict_row, small_src_btlazy_head,
+    small_src_class_plain_only, small_src_class_swapped,
 };
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};
@@ -4947,6 +5013,7 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
         && a.reach_choice == b.reach_choice
         && a.small_src_row == b.small_src_row
         && a.row_attempts == b.row_attempts
+        && a.bt_domain == b.bt_domain
         && a.ldm_arming == b.ldm_arming
         && a.ldm_mode == b.ldm_mode
         && a.dubt_head == b.dubt_head
@@ -4973,6 +5040,8 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
         && b.small_src_pending.is_none()
         && a.row_attempts_pending.is_none()
         && b.row_attempts_pending.is_none()
+        && a.bt_domain_pending.is_none()
+        && b.bt_domain_pending.is_none()
         && a.small_wide.is_none()
         && b.small_wide.is_none()
         && a.ldm_seqs.is_empty()
@@ -5038,6 +5107,7 @@ pub(crate) fn same_seeded_state(a: &MatchGeneratorDriver, b: &MatchGeneratorDriv
 }
 
 use parse_row::{RowHandle, row_hash_at, row_insert, row_insert_fill};
+pub(in crate::encoding) use price::pays_for_offset_lit;
 use price::*;
 use tables::*;
 pub(in crate::encoding) use tables::{pack_pos, push_seq_packed};

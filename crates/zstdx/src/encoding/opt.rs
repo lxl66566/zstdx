@@ -272,6 +272,16 @@ pub(crate) struct OptKnobs {
     /// btultra family: fractional prices, match+1-literal recheck, 2-pass
     /// first-block statistics seeding.
     pub ultra: bool,
+    /// The btlazy2 rows' store gate: a literal-offset tree candidate must
+    /// clear [`crate::encoding::match_generator::pays_for_offset_lit`]
+    /// (displaced literals priced at the fed-back code lengths) before it
+    /// may displace literals — the chain family's store gate, which the
+    /// btlazy port lacked: its longest-match acceptance flooded json-class
+    /// frames with five-byte matches megabytes back, each paying its full
+    /// offset in add bits. `false` keeps the port's libzstd-parity
+    /// acceptance (the row-9 DUBT head, the small-src swap rows and the
+    /// optimal parser, which prices candidates in its own DP).
+    pub pays_gate: bool,
 }
 
 /// Price statistics persisting across blocks; a zero `lit_length_sum` means

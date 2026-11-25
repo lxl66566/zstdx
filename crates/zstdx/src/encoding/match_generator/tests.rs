@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 
 use super::{
-    LdmArming, MatchGeneratorDriver, RowAttempts, ScanDensity, SmallSrcRow, ldm_min_window,
-    pack_pos, params::BalancedStore, params_for_row, unpack_pos,
+    BtDomain, LdmArming, MatchGeneratorDriver, RowAttempts, ScanDensity, SmallSrcRow,
+    ldm_min_window, pack_pos, params::BalancedStore, params_for_row, unpack_pos,
 };
 use crate::{
     encoding::{Matcher, Sequence, reach_probe::ReachChoice},
@@ -1779,6 +1779,7 @@ fn balanced_row_diet_state_is_per_frame() {
         SmallSrcRow::Btlazy,
         RowAttempts::Stock,
         BalancedStore::Chain,
+        BtDomain::Far,
     );
     let light_chain = params_for_row(
         level,
@@ -1786,6 +1787,7 @@ fn balanced_row_diet_state_is_per_frame() {
         SmallSrcRow::Btlazy,
         RowAttempts::Light,
         BalancedStore::Chain,
+        BtDomain::Far,
     );
     assert_eq!(
         light_chain.search_depth, stock_chain.search_depth,
@@ -1797,6 +1799,7 @@ fn balanced_row_diet_state_is_per_frame() {
         SmallSrcRow::Btlazy,
         RowAttempts::Light,
         BalancedStore::Row,
+        BtDomain::Far,
     );
     assert_eq!(
         light_twin.search_depth,
@@ -2160,7 +2163,7 @@ fn greedy_dict_rep_advance_inserts_the_searched_position() {
 /// outside the band are verdict-invariant.
 #[test]
 fn small_src_class_swap_band_rows() {
-    use super::{RowAttempts, SmallSrcRow, Strategy, params_for_row};
+    use super::{BtDomain, RowAttempts, SmallSrcRow, Strategy, params_for_row};
     let shape = crate::InputShape {
         len: Some(40 * 1024),
         window_log: None,
@@ -2175,6 +2178,7 @@ fn small_src_class_swap_band_rows() {
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
             BalancedStore::Chain,
+            BtDomain::Far,
         );
         assert!(
             matches!(swapped.strategy, Strategy::BtLazy(_)),
@@ -2188,6 +2192,7 @@ fn small_src_class_swap_band_rows() {
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
             BalancedStore::Chain,
+            BtDomain::Far,
         );
         assert!(
             matches!(&swapped.strategy, Strategy::Opt(k) if k.ultra),
@@ -2208,6 +2213,7 @@ fn small_src_class_swap_band_rows() {
         SmallSrcRow::Btlazy,
         RowAttempts::Stock,
         BalancedStore::Chain,
+        BtDomain::Far,
     );
     assert!(
         matches!(swapped.strategy, Strategy::BtLazy(_)),
@@ -2219,6 +2225,7 @@ fn small_src_class_swap_band_rows() {
         SmallSrcRow::Stock,
         RowAttempts::Stock,
         BalancedStore::Chain,
+        BtDomain::Far,
     );
     assert!(
         matches!(stock.strategy, Strategy::Dfast(_)),
@@ -2234,6 +2241,7 @@ fn small_src_class_swap_band_rows() {
             SmallSrcRow::Stock,
             RowAttempts::Stock,
             BalancedStore::Chain,
+            BtDomain::Far,
         );
         let default = params_for_row(
             crate::Level::from_zstd(level),
@@ -2241,6 +2249,7 @@ fn small_src_class_swap_band_rows() {
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
             BalancedStore::Chain,
+            BtDomain::Far,
         );
         let differs = stock.strategy != default.strategy;
         assert_eq!(
@@ -2282,6 +2291,7 @@ fn dict_frames_keep_ladder_rows_in_the_class_band() {
             },
             RowAttempts::Stock,
             BalancedStore::Chain,
+            BtDomain::Far,
         )
         .strategy
     };
@@ -2338,7 +2348,7 @@ fn win_poison_wall_fires_on_a_past_tail_touch() {
 /// declaring 1<<17 under a forced w10.
 #[test]
 fn small_src_swap_honors_a_forced_window() {
-    use super::{RowAttempts, SmallSrcRow, Strategy, params_for_row};
+    use super::{BtDomain, RowAttempts, SmallSrcRow, Strategy, params_for_row};
     let len = 100 * 1024u64;
     for level in [9i32, 10] {
         let forced = params_for_row(
@@ -2350,6 +2360,7 @@ fn small_src_swap_honors_a_forced_window() {
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
             BalancedStore::Chain,
+            BtDomain::Far,
         );
         assert_eq!(forced.window, 1 << 10, "l{level}: declared window");
         let wlog = 10u32;
@@ -2375,6 +2386,7 @@ fn small_src_swap_honors_a_forced_window() {
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
             BalancedStore::Chain,
+            BtDomain::Far,
         );
         assert_eq!(stock.window, 1 << 17, "l{level}: stock swap window");
     }

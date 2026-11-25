@@ -8,7 +8,10 @@ use super::{HASH_LOG, MAX_WINDOW, MIN_MATCH};
 use super::{HASH_READ, read8};
 use crate::{
     InputShape, Level,
-    encoding::{opt::OptKnobs, reach_probe::KEEP_REACH},
+    encoding::{
+        opt::OptKnobs,
+        reach_probe::{KEEP_REACH, SHRINK_REACH},
+    },
 };
 
 /// Which search loop the matcher runs. The `chain` buffer is the second
@@ -276,7 +279,18 @@ const fn bt_knobs(search_log: u32, bt_log: u32) -> OptKnobs {
         bt_log,
         hash3_log: 0,
         ultra: false,
+        pays_gate: false,
     }
+}
+
+/// A ladder btlazy2 row's knobs (rows 13-15): the stock `bt_knobs` form
+/// with the store gate armed (see [`OptKnobs::pays_gate`]). The geometry
+/// (search log, ring) is the row's own; the frame's domain class (see
+/// [`BtDomain`]) narrows it on near-local heads.
+const fn bt_row_knobs(search_log: u32, bt_log: u32) -> OptKnobs {
+    let mut k = bt_knobs(search_log, bt_log);
+    k.pays_gate = true;
+    k
 }
 
 /// Cold-start DUBT head (row 9): the span of frame-start blocks parsed
@@ -594,6 +608,7 @@ const fn knobs(
             0
         },
         ultra,
+        pays_gate: false,
     }
 }
 
@@ -664,19 +679,32 @@ pub(super) const LEVEL_PARAMS: [LevelParams; 23] = [
     row(23, 6, 1 << 22, 64, 2),
     // 13: the Best tier: btlazy2 — the DUBT tree (O(1) fill, search-time
     // batch sort) under lazy2 selection, libzstd's L13-15 rows (S4/5/6,
-    // searchLength 5, TL 32). The frame window rides LDM's W26 far reach
-    // with the tree's search domain at the stock W22.
+    // searchLength 5, TL 32). Two deviations from the libzstd rows, both
+    // measured against the balanced tier's json-class edge (the 2026-11-24
+    // anomaly: the stock rows read 8.5 percent sparser than the balanced
+    // row on jsonreal, 15 on json): the selection gates literal-offset
+    // candidates through the chain family's store gate
+    // ([`OptKnobs::pays_gate`]) — the port's longest-match acceptance
+    // emitted five-byte matches megabytes back whose offset add bits cost
+    // more than the literals they displaced — and the tree domain is a
+    // per-frame class (see [`BtDomain`]): the stock W22 domain trails the
+    // balanced row's wide-class twin reach (16 MiB) on jsonreal/textreal
+    // far classes and over-searches the json class's near-local repeats,
+    // so the stock row carries the Far geometry (a 16 MiB ring, one step
+    // under the opt rows' cap and the footprint rows 20-22 already hold)
+    // and near-local heads resolve it down to SHRINK_REACH. The frame
+    // window still rides LDM's W26 far reach.
     with_ldm(with_chain_reach(
-        btlazy(22, 1 << 26, bt_knobs(4, 22)),
-        1 << 22,
+        btlazy(22, 1 << 26, bt_row_knobs(4, 24)),
+        1 << 24,
     )),
     with_ldm(with_chain_reach(
-        btlazy(23, 1 << 26, bt_knobs(5, 22)),
-        1 << 22,
+        btlazy(23, 1 << 26, bt_row_knobs(5, 24)),
+        1 << 24,
     )),
     with_ldm(with_chain_reach(
-        btlazy(23, 1 << 26, bt_knobs(6, 23)),
-        1 << 22,
+        btlazy(23, 1 << 26, bt_row_knobs(6, 24)),
+        1 << 24,
     )),
     // 16: libzstd's btopt rows begin. The opt family keeps a wide frame
     // window (W26, the LDM far reach — C's --long shape) with the tree's
@@ -829,6 +857,52 @@ const fn row_light_search_depth(level: i32) -> Option<u32> {
         11 | 12 => Some(32),
         _ => None,
     }
+}
+
+/// The btlazy2 ladder rows' (13-15) tree search domain class, decided by
+/// the frame head's sampled alphabet (see [`bt_domain_near`]) — the same
+/// separating evidence the balanced row's storage twin and the row band's
+/// attempts diet key on, resolving the same split: a narrow head's repeats
+/// are near-local (json logs, tiled structured data), where a wide tree
+/// domain only feeds the selection far candidates whose offsets cost more
+/// than the literals they displace (json at a 4 KiB domain measures 3
+/// percent smaller than at 4 MiB), while a wide head's duplicated mass
+/// lives in the multi-megabyte distance classes a narrow tree can never
+/// reach (jsonreal's 4-16 MiB class covers 8 percent of its matched bytes
+/// at the balanced row's twin, textreal improves 3 percent from 4 to 16
+/// MiB, and text's tile period pins the floor: its repeats sit at 839 KiB,
+/// so a narrow-class text frame would lose its whole match mass). Every
+/// frame and every MT job starts at [`BtDomain::Far`]; the verdict is
+/// per-frame state resolved at the first matching entry (a job samples
+/// its strip content, deterministic by the job grid), and pure
+/// `(level, shape)` queries never resolve one, so headers and strip
+/// geometry keep the Far row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum BtDomain {
+    /// The row's full domain: a 16 MiB tree ring, matching the balanced
+    /// row's wide-class twin reach (the jsonreal/textreal far classes).
+    #[default]
+    Far,
+    /// Near-local heads: the domain shrinks to the chain row's probe
+    /// shrink reach ([`SHRINK_REACH`], measured optimal for the json
+    /// class), with the tree ring sized to it.
+    Near,
+}
+
+/// Head sample the domain verdict reads: the same 8 KiB span the
+/// small-src, attempts and storage verdicts sample.
+pub(crate) const BT_DOMAIN_HEAD_SPAN: usize = 8 * 1024;
+
+/// The domain verdict's sampled-alphabet bar: the same 48-symbol bar as
+/// [`BALANCED_ROW_SYMS`]/[`ROW_ATTEMPTS_LIGHT_SYMS`] — json heads read
+/// 38-39 distinct and skewed 16 below it, text 66-79 and dll 108-213
+/// above, and jsonreal's 66 sits above it with its far class.
+const BT_DOMAIN_NEAR_SYMS: u32 = 48;
+
+/// Whether a frame head's sampled alphabet takes [`BtDomain::Near`] (see
+/// [`BtDomain`]). A pure function of the head bytes.
+pub(crate) fn bt_domain_near(head: &[u8]) -> bool {
+    sampled_distinct(head, 0, head.len()) < BT_DOMAIN_NEAR_SYMS
 }
 
 /// The balanced row's candidate storage, decided by the frame head's
@@ -992,6 +1066,7 @@ pub(super) fn params_for(level: Level, shape: InputShape) -> LevelParams {
         SmallSrcRow::Btlazy,
         RowAttempts::Stock,
         BalancedStore::Chain,
+        BtDomain::Far,
     )
 }
 
@@ -1001,6 +1076,7 @@ pub(super) const fn params_for_row(
     row: SmallSrcRow,
     attempts: RowAttempts,
     store: BalancedStore,
+    bt_domain: BtDomain,
 ) -> LevelParams {
     let mut p = params_for_level(level);
     if let Some(wl) = shape.window_log {
@@ -1064,6 +1140,22 @@ pub(super) const fn params_for_row(
             swapped.window = 1usize << clamp_u32(wl, 10, 27);
         }
         return adjust_params(swapped, shape.len);
+    }
+    // The btlazy rows' domain class (see [`BtDomain`]): a near-local head
+    // shrinks the tree ring and search domain to the chain row's probe
+    // shrink reach. Only the ladder rows 13-15 reach here as btlazy2 —
+    // the small-src swap rows returned above, and the level guard keeps a
+    // future btlazy row out of the substitution until its class is
+    // measured.
+    if matches!(bt_domain, BtDomain::Near)
+        && matches!(level.as_i32(), 13..=15)
+        && let Strategy::BtLazy(knobs) = p.strategy
+    {
+        p.strategy = Strategy::BtLazy(OptKnobs {
+            bt_log: SHRINK_REACH.trailing_zeros(),
+            ..knobs
+        });
+        p.chain_reach = Some(SHRINK_REACH);
     }
     // Small-input policy (libzstd's small-src rows run searchLength 4 at
     // every lazy-family level): the row matcher's default 5 prices
@@ -1249,7 +1341,7 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
 ///
 /// The grid is the full cross product the runtime can reach through
 /// `params_for_row`: every level 0..=22, every head-verdict axis
-/// (`SmallSrcRow` × `RowAttempts`), every source-length cell that changes
+/// (`SmallSrcRow` × `RowAttempts` × `BtDomain`), every source-length cell that changes
 /// the geometry — `Some(1 << src_log)` for src_log 10..=27 (the exact
 /// powers of two, whose `ceil_log2` is the log itself) plus the
 /// unknown-length cell — and, since todo 26, the forced-window axis
@@ -1278,38 +1370,132 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
 /// a ladder edit that adds or removes a collision fails the build and
 /// forces a re-verification of the lockstep branch.
 const fn prove_ladder_geometry() -> usize {
-    const VARIANTS: [(SmallSrcRow, RowAttempts, BalancedStore); 10] = [
+    const VARIANTS: [(SmallSrcRow, RowAttempts, BalancedStore, BtDomain); 20] = [
         (
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
             BalancedStore::Chain,
+            BtDomain::Far,
         ),
-        (SmallSrcRow::Stock, RowAttempts::Stock, BalancedStore::Chain),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+            BtDomain::Far,
+        ),
         (
             SmallSrcRow::Btlazy,
             RowAttempts::Light,
             BalancedStore::Chain,
+            BtDomain::Far,
         ),
-        (SmallSrcRow::Stock, RowAttempts::Light, BalancedStore::Chain),
-        (SmallSrcRow::Btlazy, RowAttempts::Stock, BalancedStore::Row),
-        (SmallSrcRow::Stock, RowAttempts::Stock, BalancedStore::Row),
-        (SmallSrcRow::Btlazy, RowAttempts::Light, BalancedStore::Row),
-        (SmallSrcRow::Stock, RowAttempts::Light, BalancedStore::Row),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Light,
+            BalancedStore::Chain,
+            BtDomain::Far,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Row,
+            BtDomain::Far,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::Row,
+            BtDomain::Far,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Light,
+            BalancedStore::Row,
+            BtDomain::Far,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Light,
+            BalancedStore::Row,
+            BtDomain::Far,
+        ),
         (
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
             BalancedStore::RowHead,
+            BtDomain::Far,
         ),
         (
             SmallSrcRow::Stock,
             RowAttempts::Stock,
             BalancedStore::RowHead,
+            BtDomain::Far,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Light,
+            BalancedStore::Chain,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Light,
+            BalancedStore::Chain,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Row,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::Row,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Light,
+            BalancedStore::Row,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Light,
+            BalancedStore::Row,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::RowHead,
+            BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::RowHead,
+            BtDomain::Near,
         ),
     ];
     let mut collisions = 0usize;
     let mut variant = 0usize;
     while variant < VARIANTS.len() {
-        let (row, attempts, store) = VARIANTS[variant];
+        let (row, attempts, store, bt_domain) = VARIANTS[variant];
         // Axis value 0 is the unknown cell (`None`); 10..=27 the known
         // powers/clamps. Every axis value pairs with every other.
         let mut w_axis = 0u32;
@@ -1333,7 +1519,14 @@ const fn prove_ladder_geometry() -> usize {
                 let mut row_levels = 0usize;
                 let mut level = 0i32;
                 while level <= 22 {
-                    let p = params_for_row(Level::from_zstd(level), shape, row, attempts, store);
+                    let p = params_for_row(
+                        Level::from_zstd(level),
+                        shape,
+                        row,
+                        attempts,
+                        store,
+                        bt_domain,
+                    );
                     assert!(p.hash_log >= 10 && p.hash_log <= 30, "hash_log out of span");
                     // The todo-26 domain/geometry relations: everything a
                     // search can walk sits inside the final window. Level
@@ -1412,12 +1605,14 @@ const fn prove_ladder_geometry() -> usize {
 /// rehead branch. A ladder edit that moves this number fails the build —
 /// re-verify the lockstep branch in `resize_tables` (the R68 bug #3
 /// precondition: same row count at different hash logs).
-// The verdict axes grew to ten cells (the dll-class attempts diet added
-// the reachable Light x Row states), pushing the full-grid walk past the
-// lint's step budget; the proof itself is finite and completes.
+// The verdict axes grew to twenty cells (the btlazy domain verdict
+// doubled them; BtDomain cannot change row-strategy geometry — the Near
+// substitution only touches Strategy::BtLazy rows — so the count
+// doubled exactly, 2 x 4148), pushing the full-grid walk past the lint's
+// step budget; the proof itself is finite and completes.
 #[allow(long_running_const_eval)]
 const LADDER_ROW_COLLISIONS: usize = prove_ladder_geometry();
 const _: () = assert!(
-    LADDER_ROW_COLLISIONS == 4148,
+    LADDER_ROW_COLLISIONS == 8296,
     "row-geometry collision count moved: re-verify resize_tables' rows-kept lockstep branch"
 );

@@ -30,22 +30,24 @@ pub(super) fn pays_for_offset(ml: usize, idx: usize, cand: usize, rep_hit: bool)
     rep_hit || ml * 4 >= (idx - cand).ilog2() as usize + 7
 }
 
-/// The chain strategy's store gate: store the match only if the literals it
-/// displaces cost more than its offset's price (highbit plus the +7 margin,
-/// libzstd's depth-2 replacement constant). Literal bytes price at the code
-/// lengths of the previous block's Huffman table — the *marginal* cost,
-/// which separates the shapes the flat +7 margin traded against each other
-/// (json 6.21/6.55, text 368.1/366.3 at +4/+7; the whole swing is 5-byte
-/// matches in the 8-32 KiB offset band): text's displaced bytes are nearly
-/// absent from its hyper-skewed residual literal stream (~0.2 bits/B on
-/// average — the average itself is no discriminator) and price at the cap,
-/// while json's are common in its residual stream and price cheap. For
-/// matches longer than eight bytes the first eight price the run (the
-/// decision band is ml ≤ 7 anyway: at the 1 MiB window an 8-byte match
-/// clears even the flat-4 constant). With `lit_lens == DEFAULT_LIT_LENS`
-/// this reduces to the static +7 gate bit-for-bit.
+/// The chain strategy's store gate, shared with the gated btlazy2 rows
+/// (see [`super::super::opt::OptKnobs::pays_gate`]): store the match only
+/// if the literals it displaces cost more than its offset's price (highbit
+/// plus the +7 margin, libzstd's depth-2 replacement constant). Literal
+/// bytes price at the code lengths of the previous block's Huffman table
+/// — the *marginal* cost, which separates the shapes the flat +7 margin
+/// traded against each other (json 6.21/6.55, text 368.1/366.3 at +4/+7;
+/// the whole swing is 5-byte matches in the 8-32 KiB offset band):
+/// text's displaced bytes are nearly absent from its hyper-skewed
+/// residual literal stream (~0.2 bits/B on average — the average itself
+/// is no discriminator) and price at the cap, while json's are common in
+/// its residual stream and price cheap. For matches longer than eight
+/// bytes the first eight price the run (the decision band is ml ≤ 7
+/// anyway: at the 1 MiB window an 8-byte match clears even the flat-4
+/// constant). With `lit_lens == DEFAULT_LIT_LENS` this reduces to the
+/// static +7 gate bit-for-bit.
 #[inline(always)]
-pub(super) fn pays_for_offset_lit(
+pub(crate) fn pays_for_offset_lit(
     win: &[u8],
     idx: usize,
     ml: usize,

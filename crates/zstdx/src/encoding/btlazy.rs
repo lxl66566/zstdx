@@ -17,7 +17,7 @@ use super::{
     SeqWord,
     dubt::{DubtFinder, Found, Scored, lazy_price, scale_value},
     ldm::LdmSeq,
-    match_generator::{HASH_READ, MIN_MATCH, push_seq_packed},
+    match_generator::{HASH_READ, MIN_MATCH, pays_for_offset_lit, push_seq_packed},
     opt::{Match, OptKnobs, count_from, count_from_long, read4},
 };
 
@@ -204,6 +204,7 @@ pub(crate) fn run_block_lazy(
                 sufficient_len: knobs.sufficient_len as usize,
             };
             block_lazy_segments::<$m, $l, $r>(
+                knobs.pays_gate,
                 step,
                 &mut finder,
                 lit_lens,
@@ -246,6 +247,7 @@ pub(crate) fn run_block_lazy(
 /// compare form.
 #[allow(clippy::too_many_arguments)]
 fn block_lazy_segments<const MLS: usize, const LONG: bool, const REPS: bool>(
+    pays_gate: bool,
     step: LazyStep,
     finder: &mut DubtFinder<'_, '_, MLS, LONG, REPS>,
     lit_lens: &[u8; 256],
@@ -312,7 +314,32 @@ fn block_lazy_segments<const MLS: usize, const LONG: bool, const REPS: bool>(
                     score: scale_value(scale, m.len as usize),
                     m,
                 });
-                best = match (rep, f.cand) {
+                // Knob contract (`OptKnobs::pays_gate`, armed by the
+                // ladder's `bt_row_knobs` rows 13-15 and never the small-src
+                // swap rows nor the row-9 DUBT head): a literal-offset tree
+                // candidate displaces literals only when they cost more
+                // than its offset's price at the fed-back code lengths —
+                // the chain family's store gate verbatim (same arguments
+                // the chain scan passes), which the port's longest-match
+                // acceptance lacked: json-class frames flooded with
+                // five-byte matches megabytes back, each paying its full
+                // offset in add bits. All candidates at one position share
+                // the scale, so gating the argmax alone decides the
+                // position (a paying candidate always outscores an unpaid
+                // one at the same scale). Any rework of this loop must
+                // keep the gate at the depth-0 acceptance.
+                let cand = f.cand.filter(|c| {
+                    !pays_gate
+                        || pays_for_offset_lit(
+                            win,
+                            idx,
+                            c.m.len as usize,
+                            idx - (c.m.off as usize - 3),
+                            false,
+                            lit_lens,
+                        )
+                });
+                best = match (rep, cand) {
                     (Some(r), Some(c)) if r.score >= c.score => Some(r),
                     (_, Some(c)) => Some(c),
                     (Some(r), None) => Some(r),
