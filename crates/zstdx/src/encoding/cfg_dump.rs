@@ -157,6 +157,9 @@ pub struct FrameRecord {
     /// The reach probe donated job zero's span.
     pub donated: bool,
     pub spf: SpfTag,
+    /// The jobs' storage verdict (see `plain_job_balanced_store`): the
+    /// balanced row's twin when the frame armed the substitution.
+    pub bal_store: StoreTag,
 }
 
 #[derive(Debug)]

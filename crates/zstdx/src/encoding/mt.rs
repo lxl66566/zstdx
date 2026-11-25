@@ -340,7 +340,7 @@ pub fn compress_slice_mt(
     // the history below (`job_overlap`); the grid stays the strip's or the
     // capture lattice's own pin.
     let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
-    let job_size = capture_grid(
+    let capture = capture_grid(
         src.len() as u64,
         level,
         shape,
@@ -348,8 +348,18 @@ pub fn compress_slice_mt(
         head,
         fast_window,
         ldm_mode,
-    )
-    .unwrap_or_else(|| job_size_for_level(level, src.len() as u64, workers, strip));
+    );
+    // The plain jobs' storage verdict (see `plain_job_balanced_store`):
+    // a row frame passes the head sample so every job resolves the twin
+    // on its own driver; stock frames pass an empty sample, which keeps
+    // the chain the reset already restored.
+    let bal_store = plain_job_balanced_store(level, shape, choice, capture, dict.is_some(), head);
+    let bal_head: &[u8] = match bal_store {
+        BalancedStore::Chain => &[],
+        _ => &head[..head.len().min(BALANCED_STORE_HEAD_SPAN)],
+    };
+    let job_size =
+        capture.unwrap_or_else(|| job_size_for_level(level, src.len() as u64, workers, strip));
     let n_jobs = src.len().div_ceil(job_size);
     let threads = (workers as usize).min(n_jobs);
 
@@ -465,6 +475,11 @@ pub fn compress_slice_mt(
                 Some(PrefixPlan::Whole { .. }) => super::cfg_dump::SpfTag::Whole,
                 Some(PrefixPlan::Windowed(_)) => super::cfg_dump::SpfTag::Windowed,
                 Some(PrefixPlan::SelfFill { .. }) => super::cfg_dump::SpfTag::SelfFill,
+            },
+            bal_store: match bal_store {
+                BalancedStore::Chain => super::cfg_dump::StoreTag::Chain,
+                BalancedStore::Row => super::cfg_dump::StoreTag::Row,
+                BalancedStore::RowHead => super::cfg_dump::StoreTag::RowHead,
             },
         },
     ));
@@ -674,6 +689,7 @@ pub fn compress_slice_mt(
                             job_ldm,
                             snapshot.job_spf(),
                             ldm_mode,
+                            bal_head,
                         )
                     }));
                     #[cfg(feature = "job_trace")]
@@ -793,6 +809,44 @@ struct ReachGate {
 pub(crate) fn head_predicts_keep(head: &[u8]) -> bool {
     let span = head.len().min(BALANCED_STORE_HEAD_SPAN);
     balanced_store(&head[..span]) != BalancedStore::Chain
+}
+
+/// The balanced row's storage substitution for the jobs of a plain
+/// lattice: the ST entry flips a wide-head level-9 frame onto the row
+/// twin wholesale (see `compress_slice_shaped_ldm`), and the plain jobs
+/// resolve the same verdict so their parse does not stand behind the
+/// frame-continuous one — on jsonreal l9 bulk-mt measured +10.8 percent
+/// over bulk-st with the whole deficit attributed to the substitution
+/// (the `stmdiff` `ZSTDX_CFG_DUMP_ST_CHAIN` latch, 2026-11-24), while the
+/// per-job machinery (LDM restarts, entropy, rep gates) reads at parity.
+/// The jobs keep the stock strip and grid: the twin's 16 MiB reach needs
+/// a strip that wide to serve cross-job history, a fill volume the
+/// per-job strip model pays 4x on a 32 MiB frame — the wall-safe sharing
+/// schedule is the recorded R78-L port, so the substitution here buys
+/// the in-strip and in-job selection gap alone. Capture-class frames
+/// (dll-shaped heads) keep the stock chain jobs: their lattices own the
+/// bytes through the shared prefix fill, whose snapshot machinery has no
+/// row-store twins. Dictionary frames keep the chain like the ST
+/// dictionary entry, which never resolves a verdict.
+fn plain_job_balanced_store(
+    level: Level,
+    shape: crate::InputShape,
+    choice: reach_probe::ReachChoice,
+    capture: Option<usize>,
+    dict: bool,
+    head: &[u8],
+) -> BalancedStore {
+    if level.as_i32() == 9
+        && choice == reach_probe::ReachChoice::Keep
+        && !dict
+        && capture.is_none()
+        && shape.len.is_some_and(|n| n >= reach_probe::PROBE_MIN_FRAME)
+    {
+        let span = head.len().min(BALANCED_STORE_HEAD_SPAN);
+        balanced_store(&head[..span])
+    } else {
+        BalancedStore::Chain
+    }
 }
 
 /// Resolve the frame's reach verdict and the job-zero donation it arms:
@@ -2122,8 +2176,17 @@ pub(crate) fn prepare_job_state(
     ldm: LdmArming,
     job_start: u64,
     ldm_mode: crate::LdmMode,
+    bal_head: &[u8],
 ) {
     reset_slice_state_mode(state, level, shape, choice, ldm, ldm_mode);
+    // The plain jobs' storage verdict (see `plain_job_balanced_store`): a
+    // non-empty sample resolves the balanced row's twin exactly as the
+    // ST entry does, after the reset restored the chain default; an
+    // empty one keeps the chain, so no job inherits another frame's
+    // row parse through the pool.
+    if !bal_head.is_empty() {
+        state.matcher.consider_balanced_store(bal_head, level);
+    }
     if job_start > 0 {
         state.matcher.gate_repcodes();
         let depth = ramp_depth_from_env();
@@ -2162,10 +2225,20 @@ pub(crate) fn run_job_with(
     ldm: LdmArming,
     spf: JobSpf<'_>,
     ldm_mode: crate::LdmMode,
+    bal_head: &[u8],
 ) -> Vec<u8> {
     #[cfg(feature = "job_trace")]
     let trace_reset = std::time::Instant::now();
-    prepare_job_state(state, level, shape, choice, ldm, job.start as u64, ldm_mode);
+    prepare_job_state(
+        state,
+        level,
+        shape,
+        choice,
+        ldm,
+        job.start as u64,
+        ldm_mode,
+        bal_head,
+    );
     #[cfg(feature = "job_trace")]
     super::job_trace::add_reset(trace_reset);
     // The windowed band's chain tables cover the reach tail; every other
@@ -2204,6 +2277,7 @@ pub(crate) fn run_job(
     ldm: LdmArming,
     spf: JobSpf<'_>,
     ldm_mode: crate::LdmMode,
+    bal_head: &[u8],
 ) -> Vec<u8> {
     let mut state = take_pooled_slice_state(level, shape, choice, ldm);
     let output = run_job_with(
@@ -2218,6 +2292,7 @@ pub(crate) fn run_job(
         ldm,
         spf,
         ldm_mode,
+        bal_head,
     );
     return_pooled_slice_state(state);
     output
@@ -2231,14 +2306,16 @@ mod tests {
     use super::{
         CAPTURE_JOB_CAP, MIN_JOB_SIZE, capture_grid, capture_job_size, compress_slice_mt,
         dict_job_arming, donation_arming, fast_capture_schedule, head_predicts_keep, job_size_for,
-        plan_prefix_ldm, prefix_last_job, take_slice_state,
+        plain_job_balanced_store, plan_prefix_ldm, prefix_last_job, take_slice_state,
     };
     use crate::{
         Level,
         common::MAX_BLOCK_SIZE,
         decoding::FrameDecoder,
         encoding::{
-            match_generator::{LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver},
+            match_generator::{
+                BalancedStore, LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver, balanced_store,
+            },
             reach_probe::ReachChoice,
         },
         tests::mem_gate::{HeavyMem, heavy_mem},
@@ -2429,6 +2506,122 @@ mod tests {
     /// edges: only the source-clamped window in [W25, W26) engages — a
     /// `Job`-armed donation would parse the span without LDM there, so the
     /// pairing with `donation_arming` is load-bearing exactly in this band.
+    /// The plain jobs' storage verdict resolves exactly the ST entry's
+    /// substitution population: level 9 past the probe's size bar with a
+    /// wide head on a plain lattice. The size bar, the capture, the
+    /// dictionary, a Shrink verdict and every other row keep the stock
+    /// chain jobs.
+    #[test]
+    fn plain_job_balanced_store_gates_the_substitution() {
+        let shape = |len: u64| crate::InputShape {
+            len: Some(len),
+            window_log: None,
+        };
+        let over_bar = shape(8 * 1024 * 1024);
+        let under_bar = shape(8 * 1024 * 1024 - 1);
+        let wide = pattern_head(8 * 1024);
+        let narrow = alphabet_head(8 * 1024, 16);
+        assert_eq!(
+            plain_job_balanced_store(
+                Level::Balanced,
+                over_bar,
+                ReachChoice::Keep,
+                None,
+                false,
+                &wide,
+            ),
+            balanced_store(&wide),
+        );
+        assert_eq!(
+            plain_job_balanced_store(
+                Level::Balanced,
+                under_bar,
+                ReachChoice::Keep,
+                None,
+                false,
+                &wide,
+            ),
+            BalancedStore::Chain,
+        );
+        for (level, capture, dict, choice, head) in [
+            (Level::Fastest, false, false, ReachChoice::Keep, &wide[..]),
+            (Level::Balanced, true, false, ReachChoice::Keep, &wide[..]),
+            (Level::Balanced, false, true, ReachChoice::Keep, &wide[..]),
+            (
+                Level::Balanced,
+                false,
+                false,
+                ReachChoice::Shrink,
+                &wide[..],
+            ),
+            (
+                Level::Balanced,
+                false,
+                false,
+                ReachChoice::Keep,
+                &narrow[..],
+            ),
+        ] {
+            assert_eq!(
+                plain_job_balanced_store(
+                    level,
+                    over_bar,
+                    choice,
+                    capture.then_some(4 * 1024 * 1024),
+                    dict,
+                    head,
+                ),
+                BalancedStore::Chain,
+                "level {level:?} capture {capture} dict {dict} choice {choice:?}",
+            );
+        }
+    }
+
+    /// The substitution rides the pooled job states like any schedule:
+    /// repeated in-process calls, a stock chain frame interleaved between
+    /// two armed ones, and the roundtrip all hold. The armed fixture is a
+    /// wide head past the probe's size bar (the population
+    /// `plain_job_balanced_store` gates), the interleaved one a narrow
+    /// head over the same bar, so the pool round-trips the row store and
+    /// the chain flip-back in one process.
+    #[test]
+    fn row_substitution_bulk_mt_is_pooled_deterministic() {
+        let armed = pattern_head((8 << 20) + (511 << 10));
+        let stock = alphabet_head((8 << 20) + (17 << 10), 16);
+        let enc = |src: &[u8]| {
+            compress_slice_mt(
+                src,
+                Level::Balanced,
+                false,
+                4,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            )
+        };
+        let one = enc(&armed);
+        let stock_one = enc(&stock);
+        // Second calls ride pooled states the previous frames left in
+        // both storage forms.
+        let two = enc(&armed);
+        let stock_two = enc(&stock);
+        assert_eq!(one, two);
+        assert_eq!(stock_one, stock_two);
+        // Re-armed after the chain frames: the flip back onto the row
+        // twin reproduces the fresh armed bytes.
+        let three = enc(&armed);
+        assert_eq!(one, three);
+        for (label, frame, src) in [
+            ("armed", &one, &armed[..]),
+            ("stock", &stock_one, &stock[..]),
+        ] {
+            let mut back = vec![0u8; src.len()];
+            let n = FrameDecoder::new().decode_all(frame, &mut back).unwrap();
+            assert_eq!((n, &back[..n]), (src.len(), src), "{label}");
+        }
+    }
+
     #[test]
     fn donation_arming_pairs_with_the_capture_plan() {
         let src = pattern_head(MAX_BLOCK_SIZE as usize);

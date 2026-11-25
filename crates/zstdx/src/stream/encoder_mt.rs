@@ -930,6 +930,7 @@ fn run_claimed_job(
                             *ldm,
                             *first as u64,
                             job.ldm_mode,
+                            &[],
                         );
                         compress_job_blocks_inner(
                             state,
@@ -962,6 +963,10 @@ fn run_claimed_job(
                             _ => JobSpf::None,
                         },
                         job.ldm_mode,
+                        // The stream cores keep the stock chain jobs: the
+                        // balanced row's substitution is bulk-only until
+                        // the stream-side re-grid and staging port lands.
+                        &[],
                     ),
                     // The serial feed's job (the opt rows' far class): the
                     // posted span replaces the driver's own LDM, the
@@ -978,6 +983,7 @@ fn run_claimed_job(
                         *ldm,
                         JobSpf::Feed(seqs.as_slice(), window),
                         job.ldm_mode,
+                        &[],
                     ),
                 }
             };
@@ -3365,6 +3371,9 @@ impl MtEncoderCore {
             self.job_ldm,
             spf,
             self.ldm_mode,
+            // Stock chain jobs on the stream cores (see the posted-job
+            // arm above).
+            &[],
         );
         return_pooled_state(state);
         self.push_out_segment(bytes);

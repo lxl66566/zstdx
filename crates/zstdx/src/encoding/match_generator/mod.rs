@@ -1964,7 +1964,13 @@ impl MatchGeneratorDriver {
         }
         self.bal_store = store;
         self.row_attempts = attempts;
+        // The twin's attempts verdict is final here: the store's own head
+        // sample resolved it (Row's wide class pays the Light budget,
+        // RowHead's narrower one keeps Stock), so the pending re-resolution
+        // `apply_level` armed must not run — on an MT job its sample would
+        // be the strip bytes below the job start, not the frame head.
         self.apply_level(level);
+        self.row_attempts_pending = None;
         self.strategy_phase_reset();
         #[cfg(feature = "cfg_dump")]
         self.cfg_flip("balanced_store");
