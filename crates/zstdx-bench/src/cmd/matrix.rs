@@ -59,9 +59,10 @@ use crate::{
 /// Curated decode set: the informative level/shape combinations (the
 /// omitted variants are redundant with their neighbours). The `bool` marks
 /// optional entries: absent files are skipped with a note instead of
-/// failing (the `.zst19` trio entered `gen_corpus.sh` later; older corpora
-/// lack it).
-const DEC_FILES: [(&str, Shape, bool); 14] = [
+/// failing (the `.zst19` trio entered `gen_corpus.sh` later, and the
+/// real-world axes come from the opt-in `gen_real.sh`, which carries only
+/// the .zst1/3/9 variants).
+const DEC_FILES: [(&str, Shape, bool); 20] = [
     ("json.zst1", Shape::Json, false),
     ("json.zst3", Shape::Json, false),
     ("json.zst9", Shape::Json, false),
@@ -76,6 +77,12 @@ const DEC_FILES: [(&str, Shape, bool); 14] = [
     ("skewed.zst19", Shape::Skewed, true),
     ("random.zst3", Shape::Random, false),
     ("zeros.zst3", Shape::Zeros, false),
+    ("jsonreal.zst1", Shape::JsonReal, true),
+    ("jsonreal.zst3", Shape::JsonReal, true),
+    ("jsonreal.zst9", Shape::JsonReal, true),
+    ("textreal.zst1", Shape::TextReal, true),
+    ("textreal.zst3", Shape::TextReal, true),
+    ("textreal.zst9", Shape::TextReal, true),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -388,12 +395,16 @@ fn t1_dec_st(ab: &Ab, args: &Args) {
     // percent at width 3 on 2026-11-01 - and the section is cheap. The
     // jobs flow through run_cells at width 1, plain serial execution.
     let mut jobs: Vec<(String, PathBuf)> = Vec::new();
+    let selected = shapes_selected(args);
     for &(f, shape, optional) in &DEC_FILES {
-        if !want(&args.shape, &shape) {
+        if !selected.contains(&shape) {
             continue;
         }
         if optional && !corpus_dir().join(f).exists() {
-            println!("-- {f}: absent (regenerate with bench/gen_corpus.sh), skipped");
+            println!(
+                "-- {f}: absent (regenerate with bench/gen_corpus.sh or bench/gen_real.sh), \
+                 skipped"
+            );
             continue;
         }
         jobs.push((f.to_owned(), corpus_dir().join(f)));
@@ -439,13 +450,19 @@ fn t2_dec_mt(args: &Args) {
         .into_iter()
         .filter(|w| want(&args.workers, w))
         .collect();
-    for (f, shape) in [
-        ("json.zst3", Shape::Json),
-        ("text.zst3", Shape::Text),
-        ("skewed.zst9", Shape::Skewed),
-        ("random.zst3", Shape::Random),
+    for (f, shape, optional) in [
+        ("json.zst3", Shape::Json, false),
+        ("text.zst3", Shape::Text, false),
+        ("skewed.zst9", Shape::Skewed, false),
+        ("random.zst3", Shape::Random, false),
+        ("jsonreal.zst3", Shape::JsonReal, true),
+        ("textreal.zst3", Shape::TextReal, true),
     ] {
-        if !want(&args.shape, &shape) {
+        if !shapes_selected(args).contains(&shape) {
+            continue;
+        }
+        if optional && !corpus_dir().join(f).exists() {
+            println!("-- {f}: absent (regenerate with bench/gen_real.sh), skipped");
             continue;
         }
         let (comp, raw) = load(f);

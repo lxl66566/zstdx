@@ -1,0 +1,165 @@
+# ratio sweep: 120 cells (5 shapes x 6 levels x 4 modes), checksums off, parallel 16, mt-workers 4, ref zstd crate
+cell                              raw     zstdx        r      zstd        r       Δ%
+json.fastest.bulk-st         33554523   5232221     6.413    5495185     6.106    +5.03%
+json.fastest.bulk-mt         33554523   5243285     6.400    5488123     6.114    +4.67%
+json.fastest.stream-st       33554523   5232182     6.413    5495184     6.106    +5.03%
+json.fastest.stream-mt       33554523   5256793     6.383    5488119     6.114    +4.40%
+json.fast.bulk-st            33554523   6336103     5.296    6339220     5.293    +0.05%
+json.fast.bulk-mt            33554523   6333599     5.298    6324938     5.305    -0.14%
+json.fast.stream-st          33554523   6336103     5.296    6389264     5.252    +0.84%
+json.fast.stream-mt          33554523   6332648     5.299    6324934     5.305    -0.12%
+json.balanced.bulk-st        33554523   4661008     7.199    5639335     5.950   +20.99%
+json.balanced.bulk-mt        33554523   4662684     7.196    5636753     5.953   +20.89%
+json.balanced.stream-st      33554523   4661008     7.199    5639351     5.950   +20.99%
+json.balanced.stream-mt      33554523   4664649     7.193    5636749     5.953   +20.84%
+json.best.bulk-st            33554523   4635395     7.239    5500580     6.100   +18.66%
+json.best.bulk-mt            33554523   4635399     7.239    5498843     6.102   +18.63%
+json.best.stream-st          33554523   4635395     7.239    5500578     6.100   +18.66%
+json.best.stream-mt          33554523   4635400     7.239    5498839     6.102   +18.63%
+json.opt.bulk-st             33554523   4487001     7.478    4481382     7.488    -0.13%
+json.opt.bulk-mt             33554523   4481531     7.487    4481379     7.488    -0.00%
+json.opt.stream-st           33554523   4487001     7.478    4482274     7.486    -0.11%
+json.opt.stream-mt           33554523   4481527     7.487    4481375     7.488    -0.00%
+json.ultra.bulk-st           33554523   4519442     7.424    4522548     7.419    +0.07%
+json.ultra.bulk-mt           33554523   4524057     7.417    4522546     7.419    -0.03%
+json.ultra.stream-st         33554523   4519442     7.424    4524530     7.416    +0.11%
+json.ultra.stream-mt         33554523   4524053     7.417    4522542     7.419    -0.03%
+text.fastest.bulk-st         33554432    108509   309.232     108613   308.936    +0.10%
+text.fastest.bulk-mt         33554432    108525   309.186     843555    39.777  +677.29%
+text.fastest.stream-st       33554432    108512   309.223    1838306    18.253 +1594.10%
+text.fastest.stream-mt       33554432    108536   309.155     843554    39.777  +677.21%
+text.fast.bulk-st            33554432    100755   333.030     100795   332.898    +0.04%
+text.fast.bulk-mt            33554432    100771   332.977     177385   189.162   +76.03%
+text.fast.stream-st          33554432    100758   333.020     100794   332.901    +0.04%
+text.fast.stream-mt          33554432    100773   332.970     177384   189.163   +76.02%
+text.balanced.bulk-st        33554432     87231   384.662      88673   378.406    +1.65%
+text.balanced.bulk-mt        33554432     87247   384.591      88699   378.295    +1.66%
+text.balanced.stream-st      33554432     87234   384.649      88722   378.197    +1.71%
+text.balanced.stream-mt      33554432     87237   384.635      88698   378.300    +1.67%
+text.best.bulk-st            33554432     86916   386.056      86951   385.900    +0.04%
+text.best.bulk-mt            33554432     86920   386.038      86977   385.785    +0.07%
+text.best.stream-st          33554432     86919   386.043      87011   385.634    +0.11%
+text.best.stream-mt          33554432     86911   386.078      86976   385.790    +0.07%
+text.opt.bulk-st             33554432     82073   408.836      81819   410.106    -0.31%
+text.opt.bulk-mt             33554432     82096   408.722      81840   410.000    -0.31%
+text.opt.stream-st           33554432     82076   408.821      81841   409.995    -0.29%
+text.opt.stream-mt           33554432     82095   408.727      81839   410.005    -0.31%
+text.ultra.bulk-st           33554432     81025   414.124      81054   413.976    +0.04%
+text.ultra.bulk-mt           33554432     81058   413.956      81075   413.869    +0.02%
+text.ultra.stream-st         33554432     81028   414.109      81076   413.864    +0.06%
+text.ultra.stream-mt         33554432     81057   413.961      81074   413.874    +0.02%
+skewed.fastest.bulk-st       33554432  16782185     1.999   16782141     1.999    -0.00%
+skewed.fastest.bulk-mt       33554432  16782609     1.999   16782365     1.999    -0.00%
+skewed.fastest.stream-st     33554432  16782160     1.999   16782140     1.999    -0.00%
+skewed.fastest.stream-mt     33554432  16782887     1.999   16782364     1.999    -0.00%
+skewed.fast.bulk-st          33554432  17467510     1.921   17471754     1.920    +0.02%
+skewed.fast.bulk-mt          33554432  17472897     1.920   17470648     1.921    -0.01%
+skewed.fast.stream-st        33554432  17467513     1.921   17471753     1.920    +0.02%
+skewed.fast.stream-mt        33554432  17475943     1.920   17470647     1.921    -0.03%
+skewed.balanced.bulk-st      33554432  16782193     1.999   18263376     1.837    +8.83%
+skewed.balanced.bulk-mt      33554432  16785658     1.999   18258359     1.838    +8.77%
+skewed.balanced.stream-st    33554432  16782196     1.999   18263380     1.837    +8.83%
+skewed.balanced.stream-mt    33554432  16783776     1.999   18258358     1.838    +8.79%
+skewed.best.bulk-st          33554432  16786735     1.999   18210558     1.843    +8.48%
+skewed.best.bulk-mt          33554432  16786739     1.999   18207355     1.843    +8.46%
+skewed.best.stream-st        33554432  16786738     1.999   18210568     1.843    +8.48%
+skewed.best.stream-mt        33554432  16786780     1.999   18207354     1.843    +8.46%
+skewed.opt.bulk-st           33554432  16812178     1.996   16802359     1.997    -0.06%
+skewed.opt.bulk-mt           33554432  16812827     1.996   16802359     1.997    -0.06%
+skewed.opt.stream-st         33554432  16812181     1.996   16802357     1.997    -0.06%
+skewed.opt.stream-mt         33554432  16812826     1.996   16802358     1.997    -0.06%
+skewed.ultra.bulk-st         33554432  16814561     1.996   16807639     1.996    -0.04%
+skewed.ultra.bulk-mt         33554432  16815875     1.995   16807639     1.996    -0.05%
+skewed.ultra.stream-st       33554432  16814564     1.996   16807649     1.996    -0.04%
+skewed.ultra.stream-mt       33554432  16815874     1.995   16807638     1.996    -0.05%
+random.fastest.bulk-st       33554432  33555206     1.000   33555210     1.000    +0.00%
+random.fastest.bulk-mt       33554432  33555210     1.000   33555210     1.000    +0.00%
+random.fastest.stream-st     33554432  33555209     1.000   33555209     1.000    +0.00%
+random.fastest.stream-mt     33554432  33555206     1.000   33555209     1.000    +0.00%
+random.fast.bulk-st          33554432  33555206     1.000   33555210     1.000    +0.00%
+random.fast.bulk-mt          33554432  33555210     1.000   33555210     1.000    +0.00%
+random.fast.stream-st        33554432  33555209     1.000   33555209     1.000    +0.00%
+random.fast.stream-mt        33554432  33555206     1.000   33555209     1.000    +0.00%
+random.balanced.bulk-st      33554432  33555206     1.000   33555210     1.000    +0.00%
+random.balanced.bulk-mt      33554432  33555210     1.000   33555210     1.000    +0.00%
+random.balanced.stream-st    33554432  33555209     1.000   33555209     1.000    +0.00%
+random.balanced.stream-mt    33554432  33555206     1.000   33555209     1.000    +0.00%
+random.best.bulk-st          33554432  33555206     1.000   33555210     1.000    +0.00%
+random.best.bulk-mt          33554432  33555210     1.000   33555210     1.000    +0.00%
+random.best.stream-st        33554432  33555209     1.000   33555209     1.000    +0.00%
+random.best.stream-mt        33554432  33555206     1.000   33555209     1.000    +0.00%
+random.opt.bulk-st           33554432  33555206     1.000   33555210     1.000    +0.00%
+random.opt.bulk-mt           33554432  33555210     1.000   33555210     1.000    +0.00%
+random.opt.stream-st         33554432  33555209     1.000   33555209     1.000    +0.00%
+random.opt.stream-mt         33554432  33555209     1.000   33555209     1.000    +0.00%
+random.ultra.bulk-st         33554432  33555206     1.000   33555210     1.000    +0.00%
+random.ultra.bulk-mt         33554432  33555210     1.000   33555210     1.000    +0.00%
+random.ultra.stream-st       33554432  33555209     1.000   33555209     1.000    +0.00%
+random.ultra.stream-mt       33554432  33555209     1.000   33555209     1.000    +0.00%
+zeros.fastest.bulk-st        33554432      1030     32577       1043     32171    +1.26%
+zeros.fastest.bulk-mt        33554432      1034     32451       1148     29229   +11.03%
+zeros.fastest.stream-st      33554432      1033     32483       1042     32202    +0.87%
+zeros.fastest.stream-mt      33554432      1030     32577       1147     29254   +11.36%
+zeros.fast.bulk-st           33554432      1030     32577       1043     32171    +1.26%
+zeros.fast.bulk-mt           33554432      1034     32451       1064     31536    +2.90%
+zeros.fast.stream-st         33554432      1033     32483       1042     32202    +0.87%
+zeros.fast.stream-mt         33554432      1030     32577       1063     31566    +3.20%
+zeros.balanced.bulk-st       33554432      1030     32577       1042     32202    +1.17%
+zeros.balanced.bulk-mt       33554432      1034     32451       1049     31987    +1.45%
+zeros.balanced.stream-st     33554432      1033     32483       1041     32233    +0.77%
+zeros.balanced.stream-mt     33554432      1030     32577       1048     32018    +1.75%
+zeros.best.bulk-st           33554432      1030     32577       1043     32171    +1.26%
+zeros.best.bulk-mt           33554432      1034     32451       1050     31957    +1.55%
+zeros.best.stream-st         33554432      1033     32483       1042     32202    +0.87%
+zeros.best.stream-mt         33554432      1030     32577       1049     31987    +1.84%
+zeros.opt.bulk-st            33554432      1030     32577       1042     32202    +1.17%
+zeros.opt.bulk-mt            33554432      1034     32451       1042     32202    +0.77%
+zeros.opt.stream-st          33554432      1033     32483       1041     32233    +0.77%
+zeros.opt.stream-mt          33554432      1033     32483       1041     32233    +0.77%
+zeros.ultra.bulk-st          33554432      1030     32577       1042     32202    +1.17%
+zeros.ultra.bulk-mt          33554432      1034     32451       1042     32202    +0.77%
+zeros.ultra.stream-st        33554432      1033     32483       1041     32233    +0.77%
+zeros.ultra.stream-mt        33554432      1033     32483       1041     32233    +0.77%
+
+== summary ==
+-- per level, mode bulk-st (geo-mean Δ% over shapes) --
+fastest                    +1.26%
+fast                       +0.27%
+balanced                   +6.25%
+best                       +5.45%
+opt                        +0.13%
+ultra                      +0.24%
+-- per level, mode bulk-mt (geo-mean Δ% over shapes) --
+fastest                   +55.30%
+fast                      +12.58%
+balanced                   +6.28%
+best                       +5.51%
+opt                        +0.08%
+ultra                      +0.14%
+-- per level, mode stream-st (geo-mean Δ% over shapes) --
+fastest                   +78.16%
+fast                       +0.35%
+balanced                   +6.18%
+best                       +5.39%
+opt                        +0.06%
+ultra                      +0.18%
+-- per level, mode stream-mt (geo-mean Δ% over shapes) --
+fastest                   +55.31%
+fast                      +12.65%
+balanced                   +6.34%
+best                       +5.57%
+opt                        +0.08%
+ultra                      +0.14%
+-- per mode (geo-mean Δ% over cells) (geo-mean Δ%, + = denser than zstd) --
+bulk-st                    +2.24%
+bulk-mt                   +11.92%
+stream-st                 +12.30%
+stream-mt                 +11.95%
+-- per shape (geo-mean Δ% over cells) (geo-mean Δ%, + = denser than zstd) --
+json                       +7.05%
+text                      +40.27%
+skewed                     +2.78%
+random                     +0.00%
+zeros                      +2.06%
+geo-mean Δ over 120 comparisons: +9.51% | worst text.opt.stream-mt (-0.31%) best text.fastest.stream-st (+1594.10%) | wall 87.9s (parallel 16, mt-workers 4)
+sizes are deterministic: diff two runs (or two builds) to spot regressions

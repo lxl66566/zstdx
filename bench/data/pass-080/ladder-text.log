@@ -1,0 +1,48 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T3 encode ST bulk, checksums off (interleaved A/B; MiB/s of raw) ==
+sizes text.l1  ruz    108509 (r  309.23)   zstd    108613 (r  308.94)
+text.l1                     11518      8061  x 0.698 ±0.021  [0.399..0.943]  n=123
+sizes text.l2  ruz    107357 (r  312.55)   zstd    106203 (r  315.95)
+text.l2                     11701      8007  x 0.686 ±0.033  [0.498..1.370]  n=123
+sizes text.l3  ruz    100755 (r  333.03)   zstd    100795 (r  332.90)
+text.l3                     11833      6980  x 0.592 ±0.035  [0.318..1.332]  n=103
+sizes text.l4  ruz    100686 (r  333.26)   zstd    100694 (r  333.23)
+text.l4                     10798      6640  x 0.615 ±0.029  [0.297..1.299]  n=100
+sizes text.l5  ruz     94238 (r  356.06)   zstd     93643 (r  358.32)
+text.l5                      6985      4480  x 0.642 ±0.022  [0.483..1.105]  n=69
+sizes text.l6  ruz     91298 (r  367.53)   zstd     90647 (r  370.17)
+text.l6                      5510      2535  x 0.463 ±0.008  [0.399..0.575]  n=40
+sizes text.l7  ruz     90054 (r  372.60)   zstd     89495 (r  374.93)
+text.l7                      4580      2397  x 0.529 ±0.016  [0.469..0.600]  n=37
+sizes text.l8  ruz     89474 (r  375.02)   zstd     88710 (r  378.25)
+text.l8                      3838      1609  x 0.420 ±0.004  [0.399..0.518]  n=25
+sizes text.l9  ruz     87231 (r  384.66)   zstd     88673 (r  378.41)
+text.l9                      1780      1621  x 0.914 ±0.024  [0.789..1.134]  n=25
+sizes text.l10  ruz     88608 (r  378.68)   zstd     87867 (r  381.88)
+text.l10                     3121      1450  x 0.462 ±0.019  [0.360..0.512]  n=23
+sizes text.l11  ruz     88125 (r  380.76)   zstd     87419 (r  383.83)
+text.l11                     2568      1392  x 0.552 ±0.018  [0.354..0.838]  n=22
+sizes text.l12  ruz     88117 (r  380.79)   zstd     87416 (r  383.85)
+text.l12                     2484       775  x 0.312 ±0.005  [0.290..0.320]  n=13
+sizes text.l13  ruz     86916 (r  386.06)   zstd     86951 (r  385.90)
+text.l13                      872       581  x 0.664 ±0.059  [0.585..0.775]  n=10
+sizes text.l14  ruz     86461 (r  388.09)   zstd     86455 (r  388.11)
+text.l14                      873       491  x 0.563 ±0.001  [0.560..0.565]  n=8
+sizes text.l15  ruz     86267 (r  388.96)   zstd     86269 (r  388.95)
+text.l15                      864       384  x 0.453 ±0.015  [0.425..0.493]  n=6
+sizes text.l16  ruz     82133 (r  408.54)   zstd     82629 (r  406.09)
+text.l16                      949       486  x 0.515 ±0.003  [0.505..0.534]  n=8
+sizes text.l17  ruz     82073 (r  408.84)   zstd     81819 (r  410.11)
+text.l17                      944       432  x 0.457 ±0.003  [0.443..0.463]  n=7
+sizes text.l18  ruz     81172 (r  413.37)   zstd     81263 (r  412.91)
+text.l18                      542       361  x 0.665 ±0.002  [0.636..0.669]  n=6
+sizes text.l19  ruz     81025 (r  414.12)   zstd     81054 (r  413.98)
+text.l19                      498       248  x 0.498 ±0.002  [0.496..0.500]  n=4
+sizes text.l20  ruz     81025 (r  414.12)   zstd     81053 (r  413.98)
+text.l20                      320       196  x 0.610 ±0.006  [0.594..0.619]  n=4
+sizes text.l21  ruz     81011 (r  414.20)   zstd     81031 (r  414.09)
+text.l21                      302       139  x 0.446 ±0.001  [0.445..0.460]  n=3
+sizes text.l22  ruz     81007 (r  414.22)   zstd     81026 (r  414.12)
+text.l22                      327       122  x 0.373 ±0.000  [0.373..0.374]  n=3
+-- checksum overhead (ours; A/B = off/on time ratio) --
+text.fast.cksum-on/off      12970     11065  x 0.854 ±0.011  [0.686..1.157]  n=172

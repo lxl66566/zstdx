@@ -1,0 +1,39 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T3 encode ST bulk, checksums off (interleaved A/B; MiB/s of raw) ==
+sizes jsonreal.fastest  ruz   4224162 (r    7.94)   zstd   4253671 (r    7.89)
+jsonreal.fastest              801      1114  x 1.366 ±0.006  [1.360..1.733]  n=11
+sizes jsonreal.fast  ruz   3684504 (r    9.11)   zstd   3691265 (r    9.09)
+jsonreal.fast                 772       867  x 1.113 ±0.004  [1.109..1.130]  n=12
+sizes jsonreal.balanced  ruz   2828334 (r   11.86)   zstd   3139622 (r   10.69)
+jsonreal.balanced             189       207  x 1.098 ±0.009  [1.089..1.130]  n=3
+sizes jsonreal.best  ruz   2749265 (r   12.20)   zstd   3105113 (r   10.81)
+jsonreal.best                  33        40  x 1.175 ±0.007  [1.168..1.319]  n=3
+sizes jsonreal.opt  ruz   2758683 (r   12.16)   zstd   2751723 (r   12.19)
+jsonreal.opt                   15        12  x 0.857 ±0.023  [0.834..0.880]  n=2
+sizes jsonreal.ultra  ruz   2631253 (r   12.75)   zstd   2630370 (r   12.76)
+jsonreal.ultra                  8         6  x 0.823 ±0.034  [0.790..0.857]  n=2
+sizes textreal.fastest  ruz  13561072 (r    2.47)   zstd  13687841 (r    2.45)
+textreal.fastest              240       451  x 1.879 ±0.000  [1.878..1.885]  n=4
+sizes textreal.fast  ruz  11896929 (r    2.82)   zstd  11895743 (r    2.82)
+textreal.fast                 247       261  x 1.054 ±0.001  [1.052..1.056]  n=4
+sizes textreal.balanced  ruz  10379907 (r    3.23)   zstd  10442826 (r    3.21)
+textreal.balanced              53        72  x 1.369 ±0.004  [1.366..1.416]  n=3
+sizes textreal.best  ruz   9746812 (r    3.44)   zstd  10076215 (r    3.33)
+textreal.best                   6        11  x 1.840 ±0.095  [1.744..1.935]  n=2
+sizes textreal.opt  ruz   9410389 (r    3.57)   zstd   9341776 (r    3.59)
+textreal.opt                    5         4  x 0.817 ±0.008  [0.809..0.826]  n=2
+sizes textreal.ultra  ruz   9111221 (r    3.68)   zstd   9111253 (r    3.68)
+textreal.ultra                  3         3  x 0.986 ±0.032  [0.954..1.019]  n=2
+sizes dll100.fastest  ruz  24066444 (r    4.36)   zstd  47922691 (r    2.19)
+dll100.fastest                484       513  x 1.052 ±0.018  [1.033..1.101]  n=3
+sizes dll100.fast  ruz  21047602 (r    4.98)   zstd  30874173 (r    3.40)
+dll100.fast                   420       412  x 0.984 ±0.012  [0.969..0.996]  n=3
+sizes dll100.balanced  ruz  19570844 (r    5.36)   zstd  22701602 (r    4.62)
+dll100.balanced               138       139  x 1.001 ±0.005  [0.995..1.053]  n=3
+sizes dll100.best  ruz  19565854 (r    5.36)   zstd  22456971 (r    4.67)
+dll100.best                    26        30  x 1.143 ±0.022  [1.121..1.165]  n=2
+sizes dll100.opt  ruz  17398450 (r    6.03)   zstd  20729963 (r    5.06)
+dll100.opt                     13        11  x 0.848 ±0.014  [0.834..0.862]  n=2
+sizes dll100.ultra  ruz  16584145 (r    6.32)   zstd  19875939 (r    5.28)
+dll100.ultra                    9         8  x 0.939 ±0.014  [0.925..0.952]  n=2
+-- checksum overhead (ours; A/B = off/on time ratio) --

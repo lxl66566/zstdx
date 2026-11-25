@@ -1,0 +1,5 @@
+bench/big/dll100.zst3: 100.00 MiB raw, 1730 MiB/s (med; min 1724)
+  mt2: 2436 MiB/s (med; min 2377)
+  mt4: 2886 MiB/s (med; min 2712)
+  mt8: 3014 MiB/s (med; min 2928)
+  mt16: 3131 MiB/s (med; min 2889)

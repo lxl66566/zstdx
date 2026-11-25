@@ -9,9 +9,12 @@
 #
 # Sections default to the daily set: dec-st dec-mt files-dll files-multi
 # enc-st enc-mt8 enc-mt16 enc-stream small ratio. The name "all" replaces
-# the list with the daily set plus the full numeric ladder per shape and
-# the serial streaming ladder over levels 1 to 22, the release gate. Each
-# section's output lands in <out>/<section>.log; a
+# the list with the daily set plus the full numeric ladder per shape, the
+# serial streaming ladder over levels 1 to 22, and the real-corpus side
+# sections that feed the README figures, the release gate. The real-world
+# shapes jsonreal/textreal (bench/gen_real.sh) join the recorded five
+# through an explicit --shape, so the core-five cells stay comparable
+# across passes. Each section's output lands in <out>/<section>.log; a
 # summary table with per-section walls prints at the end. dll100 payloads
 # join automatically when bench/big carries them; generate with
 # bench/gen_big.sh, and the multi-frame payload joins likewise through
@@ -37,10 +40,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 DAILY=(dec-st dec-mt files-dll files-multi enc-st enc-mt8 enc-mt16 enc-stream small ratio)
+REAL=(dec-st-real ratio-real enc-st-real enc-stream-mt8-real)
 if [ ${#sections[@]} -eq 0 ]; then
     sections=("${DAILY[@]}")
 elif [ "${sections[0]}" = "all" ]; then
-    sections=("${DAILY[@]}" ladder-json ladder-text ladder-skewed ladder-random ladder-zeros stream-ladder)
+    sections=("${DAILY[@]}" ladder-json ladder-text ladder-skewed ladder-random ladder-zeros stream-ladder "${REAL[@]}")
 fi
 
 # payloads outside the corpus join when present
@@ -80,9 +84,16 @@ run_section() {
         enc-stream) "$BIN" matrix --mode enc-stream --mt-workers 8 "${ENC_FILES[@]}" ;;
         small)      "$BIN" small --shape json,text --level 1,3,9 ;;
         ratio)      "$BIN" ratio ;;
+        dec-st-real)
+            "$BIN" matrix --mode dec-st --pull 4k,16k,64k,256k,1m --shape jsonreal,textreal "${DEC_FILES[@]}" ;;
+        ratio-real) "$BIN" ratio --shape jsonreal,textreal ;;
+        enc-st-real)
+            "$BIN" matrix --mode enc-st --shape jsonreal,textreal "${ENC_FILES[@]}" ;;
+        enc-stream-mt8-real)
+            "$BIN" matrix --mode enc-stream --mt-workers 8 --shape json,text,jsonreal,textreal "${ENC_FILES[@]}" ;;
         ladder-*)   "$BIN" matrix --mode enc-st --full-ladder --shape "${sec#ladder-}" ;;
         stream-ladder)
-            "$BIN" matrix --mode enc-stream --full-ladder --no-mt --parallel 1 --shape json,text "${ENC_FILES[@]}" ;;
+            "$BIN" matrix --mode enc-stream --full-ladder --no-mt --parallel 1 --shape json,text,jsonreal,textreal "${ENC_FILES[@]}" ;;
         *)          echo "unknown section: $sec" >&2; return 1 ;;
     esac >"$stdout" 2>"$stderr"
 }

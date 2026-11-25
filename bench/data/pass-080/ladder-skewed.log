@@ -1,0 +1,47 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T3 encode ST bulk, checksums off (interleaved A/B; MiB/s of raw) ==
+sizes skewed.l1  ruz  16782185 (r    2.00)   zstd  16782141 (r    2.00)
+skewed.l1                    2640      1205  x 0.455 ±0.003  [0.441..0.466]  n=19
+sizes skewed.l2  ruz  16782185 (r    2.00)   zstd  16808468 (r    2.00)
+skewed.l2                    2544       782  x 0.307 ±0.001  [0.303..0.313]  n=13
+sizes skewed.l3  ruz  17467510 (r    1.92)   zstd  17471754 (r    1.92)
+skewed.l3                     208       217  x 1.047 ±0.005  [1.042..1.053]  n=4
+sizes skewed.l4  ruz  18519733 (r    1.81)   zstd  18516936 (r    1.81)
+skewed.l4                     149       159  x 1.068 ±0.001  [1.066..1.076]  n=3
+sizes skewed.l5  ruz  16782178 (r    2.00)   zstd  18060455 (r    1.86)
+skewed.l5                    2109       125  x 0.060 ±0.003  [0.051..0.063]  n=3
+sizes skewed.l6  ruz  16782178 (r    2.00)   zstd  18045761 (r    1.86)
+skewed.l6                    2002       106  x 0.053 ±0.000  [0.046..0.053]  n=3
+sizes skewed.l7  ruz  16782178 (r    2.00)   zstd  18209357 (r    1.84)
+skewed.l7                    1826        98  x 0.054 ±0.001  [0.040..0.054]  n=3
+sizes skewed.l8  ruz  16782178 (r    2.00)   zstd  18206388 (r    1.84)
+skewed.l8                    1718        79  x 0.047 ±0.001  [0.040..0.048]  n=3
+sizes skewed.l9  ruz  16782193 (r    2.00)   zstd  18263376 (r    1.84)
+skewed.l9                    1719        68  x 0.041 ±0.002  [0.039..0.043]  n=3
+sizes skewed.l10  ruz  16782193 (r    2.00)   zstd  18222355 (r    1.84)
+skewed.l10                   1596        52  x 0.033 ±0.002  [0.030..0.034]  n=3
+sizes skewed.l11  ruz  16782193 (r    2.00)   zstd  18215208 (r    1.84)
+skewed.l11                   1704        33  x 0.019 ±0.000  [0.017..0.020]  n=3
+sizes skewed.l12  ruz  16782193 (r    2.00)   zstd  18197895 (r    1.84)
+skewed.l12                   1449        19  x 0.013 ±0.000  [0.013..0.014]  n=3
+sizes skewed.l13  ruz  16786735 (r    2.00)   zstd  18210558 (r    1.84)
+skewed.l13                    442         7  x 0.017 ±0.000  [0.016..0.029]  n=3
+sizes skewed.l14  ruz  16786735 (r    2.00)   zstd  18208756 (r    1.84)
+skewed.l14                    144         8  x 0.053 ±0.001  [0.052..0.054]  n=2
+sizes skewed.l15  ruz  16786735 (r    2.00)   zstd  18192116 (r    1.84)
+skewed.l15                    150         6  x 0.039 ±0.003  [0.036..0.042]  n=2
+sizes skewed.l16  ruz  16810627 (r    2.00)   zstd  16805362 (r    2.00)
+skewed.l16                      3         4  x 1.508 ±0.124  [1.384..1.632]  n=2
+sizes skewed.l17  ruz  16812178 (r    2.00)   zstd  16802359 (r    2.00)
+skewed.l17                      2         2  x 0.705 ±0.030  [0.675..0.736]  n=2
+sizes skewed.l18  ruz  16814561 (r    2.00)   zstd  16806974 (r    2.00)
+skewed.l18                      2         2  x 1.056 ±0.036  [1.020..1.092]  n=2
+sizes skewed.l19  ruz  16814561 (r    2.00)   zstd  16807639 (r    2.00)
+skewed.l19                      2         1  x 0.816 ±0.045  [0.771..0.861]  n=2
+sizes skewed.l20  ruz  16815588 (r    2.00)   zstd  16808255 (r    2.00)
+skewed.l20                      1         1  x 0.753 ±0.013  [0.740..0.766]  n=2
+sizes skewed.l21  ruz  16814347 (r    2.00)   zstd  16808252 (r    2.00)
+skewed.l21                      1         1  x 0.861 ±0.029  [0.832..0.890]  n=2
+sizes skewed.l22  ruz  16814347 (r    2.00)   zstd  16808252 (r    2.00)
+skewed.l22                      1         1  x 0.868 ±0.011  [0.858..0.879]  n=2
+-- checksum overhead (ours; A/B = off/on time ratio) --

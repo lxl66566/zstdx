@@ -1,0 +1,14 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T2 decode MT scaling (solo; MiB/s; zstd has no MT decode counterpart) ==
+jsonreal.zst3.st1           2981  (ours ST bulk)
+jsonreal.zst3.zstdref       2869  (zstd ST stream reference)
+jsonreal.zst3.mt2           3739  (1.25x ours ST, 1.30x zstd stream ST)
+jsonreal.zst3.mt4           4127  (1.38x ours ST, 1.44x zstd stream ST)
+jsonreal.zst3.mt8           4313  (1.45x ours ST, 1.50x zstd stream ST)
+jsonreal.zst3.mt16          4154  (1.39x ours ST, 1.45x zstd stream ST)
+textreal.zst3.st1           1603  (ours ST bulk)
+textreal.zst3.zstdref       1311  (zstd ST stream reference)
+textreal.zst3.mt2           1897  (1.18x ours ST, 1.45x zstd stream ST)
+textreal.zst3.mt4           2272  (1.42x ours ST, 1.73x zstd stream ST)
+textreal.zst3.mt8           2756  (1.72x ours ST, 2.10x zstd stream ST)
+textreal.zst3.mt16          2850  (1.78x ours ST, 2.17x zstd stream ST)

@@ -1,0 +1,28 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T4 encode MT bulk, checksums off (interleaved A/B at equal worker counts) ==
+sizes json.fast-mt   ruz   6336103 (r    5.30)   zstd(st)   6339220 (r    5.29)
+sizes json.fast-mt8  ruz   6331119 (r    5.30)   zstd-mt   6324938 (r    5.31)
+json.fast.mt8                2393       981  x 0.408 ±0.012  [0.381..0.461]  n=16
+sizes text.fast-mt   ruz    100755 (r  333.03)   zstd(st)    100795 (r  332.90)
+sizes text.fast-mt8  ruz    100783 (r  332.94)   zstd-mt    177385 (r  189.16)
+text.fast.mt8               12230      2023  x 0.165 ±0.009  [0.146..0.188]  n=32
+sizes json.fastest.mt8 ruz   5256354 (r    6.38)   zstd-mt   5488123 (r    6.11)
+json.fastest.mt8             3538      3971  x 1.129 ±0.058  [0.948..1.359]  n=54
+sizes json.fast.mt8 ruz   6331119 (r    5.30)   zstd-mt   6324938 (r    5.31)
+json.fast.mt8                2344       993  x 0.407 ±0.019  [0.378..0.464]  n=16
+sizes json.balanced.mt8 ruz   4664200 (r    7.19)   zstd-mt   5636753 (r    5.95)
+json.balanced.mt8             391       198  x 0.485 ±0.031  [0.448..0.523]  n=4
+sizes text.fastest.mt8 ruz    108537 (r  309.15)   zstd-mt    843555 (r   39.78)
+text.fastest.mt8            18465     10437  x 0.564 ±0.044  [0.398..0.938]  n=158
+sizes text.fast.mt8 ruz    100783 (r  332.94)   zstd-mt    177385 (r  189.16)
+text.fast.mt8               11817      2015  x 0.169 ±0.009  [0.151..0.216]  n=32
+sizes text.balanced.mt8 ruz     87247 (r  384.59)   zstd-mt     88699 (r  378.30)
+text.balanced.mt8            1229      1202  x 0.955 ±0.036  [0.804..1.064]  n=19
+sizes skewed.fastest.mt8 ruz  16783041 (r    2.00)   zstd-mt  16782365 (r    2.00)
+skewed.fastest.mt8           4082      3141  x 0.771 ±0.022  [0.725..0.835]  n=49
+sizes skewed.fast.mt8 ruz  17479079 (r    1.92)   zstd-mt  17470648 (r    1.92)
+skewed.fast.mt8              1231       601  x 0.481 ±0.020  [0.456..0.582]  n=10
+sizes skewed.balanced.mt8 ruz  16785658 (r    2.00)   zstd-mt  18258359 (r    1.84)
+skewed.balanced.mt8           770       116  x 0.141 ±0.002  [0.139..0.188]  n=3
+-- zstd warm-pool reference (context reused across rounds; zstdx has no such API) --
+ref                         1556  (zstd json.fast mt16 warm)

@@ -1,0 +1,153 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T5 encode streaming ST, checksums off (interleaved A/B; 64 KiB pulls) ==
+sizes json.fastest.stream  ruz 5232182   zstd 5495184
+json.fastest.stream           608       744  x 1.225 ±0.004  [1.158..1.230]  n=10
+sizes json.fast.stream  ruz 6336103   zstd 6389264
+json.fast.stream              455       433  x 0.954 ±0.001  [0.947..0.955]  n=7
+sizes json.balanced.stream  ruz 4661008   zstd 5639351
+json.balanced.stream          153        97  x 0.638 ±0.003  [0.630..0.641]  n=3
+sizes json.best.stream  ruz 4635395   zstd 5500578
+json.best.stream               72        27  x 0.385 ±0.005  [0.381..0.413]  n=3
+sizes json.opt.stream  ruz 4487001   zstd 4482274
+json.opt.stream                 7         5  x 0.748 ±0.020  [0.728..0.768]  n=2
+sizes json.ultra.stream  ruz 4519442   zstd 4524530
+json.ultra.stream               3         2  x 0.798 ±0.028  [0.771..0.826]  n=2
+sizes text.fastest.stream  ruz 108512   zstd 1838306
+text.fastest.stream          6536      1704  x 0.261 ±0.003  [0.248..0.272]  n=27
+sizes text.fast.stream  ruz 100758   zstd 100794
+text.fast.stream             6476      5025  x 0.774 ±0.012  [0.746..0.855]  n=79
+sizes text.balanced.stream  ruz 87234   zstd 88722
+text.balanced.stream         1483      1586  x 1.068 ±0.006  [1.054..1.204]  n=23
+sizes text.best.stream  ruz 86919   zstd 87011
+text.best.stream              973       871  x 0.895 ±0.007  [0.873..0.979]  n=14
+sizes text.opt.stream  ruz 82076   zstd 81841
+text.opt.stream               879       396  x 0.451 ±0.001  [0.450..0.454]  n=7
+sizes text.ultra.stream  ruz 81028   zstd 81076
+text.ultra.stream             480       239  x 0.498 ±0.002  [0.495..0.501]  n=4
+sizes jsonreal.fastest.stream  ruz 4224165   zstd 4254361
+jsonreal.fastest.stream       773      1003  x 1.296 ±0.002  [1.290..1.312]  n=13
+sizes jsonreal.fast.stream  ruz 3684507   zstd 3698550
+jsonreal.fast.stream          758       737  x 0.971 ±0.002  [0.960..0.974]  n=12
+sizes jsonreal.balanced.stream  ruz 2828337   zstd 3141701
+jsonreal.balanced.stream      187       193  x 1.036 ±0.016  [1.005..1.052]  n=3
+sizes jsonreal.best.stream  ruz 2749268   zstd 3106348
+jsonreal.best.stream           34        41  x 1.209 ±0.031  [1.178..1.242]  n=3
+sizes jsonreal.opt.stream  ruz 2758686   zstd 2753306
+jsonreal.opt.stream            14        12  x 0.802 ±0.009  [0.793..0.811]  n=2
+sizes jsonreal.ultra.stream  ruz 2631256   zstd 2632504
+jsonreal.ultra.stream           7         6  x 0.776 ±0.008  [0.768..0.785]  n=2
+sizes textreal.fastest.stream  ruz 13561075   zstd 13688287
+textreal.fastest.stream       241       428  x 1.771 ±0.001  [1.769..1.777]  n=4
+sizes textreal.fast.stream  ruz 11896932   zstd 11945274
+textreal.fast.stream          263       251  x 0.953 ±0.001  [0.951..0.954]  n=4
+sizes textreal.balanced.stream  ruz 10379910   zstd 10445453
+textreal.balanced.stream       54        63  x 1.170 ±0.010  [1.160..1.194]  n=3
+sizes textreal.best.stream  ruz 9746815   zstd 10078955
+textreal.best.stream            6        12  x 1.861 ±0.029  [1.832..1.890]  n=2
+sizes textreal.opt.stream  ruz 9410392   zstd 9342835
+textreal.opt.stream             5         4  x 0.776 ±0.064  [0.711..0.840]  n=2
+sizes textreal.ultra.stream  ruz 9111224   zstd 9112317
+textreal.ultra.stream           3         3  x 0.923 ±0.006  [0.917..0.929]  n=2
+sizes dll100.fastest.stream  ruz 24066447   zstd 47915177
+dll100.fastest.stream         484       495  x 1.018 ±0.002  [1.016..1.022]  n=3
+sizes dll100.fast.stream  ruz 21047605   zstd 30594727
+dll100.fast.stream            424       390  x 0.910 ±0.012  [0.896..0.922]  n=3
+sizes dll100.balanced.stream  ruz 19570847   zstd 22832690
+dll100.balanced.stream        140       131  x 0.936 ±0.003  [0.934..0.940]  n=3
+sizes dll100.best.stream  ruz 19565857   zstd 22575243
+dll100.best.stream             27        29  x 1.078 ±0.037  [1.041..1.115]  n=2
+sizes dll100.opt.stream  ruz 17398453   zstd 20746472
+dll100.opt.stream              13        11  x 0.783 ±0.015  [0.767..0.798]  n=2
+sizes dll100.ultra.stream  ruz 16584148   zstd 19889926
+dll100.ultra.stream             9         8  x 0.879 ±0.026  [0.852..0.905]  n=2
+== T5b encode streaming MT(8), checksums off (interleaved A/B; 64 KiB pulls) ==
+sizes json.fastest.stream-mt8  ruz 5270507   zstd 5488119
+json.fastest.stream-mt8      3356      1828  x 0.543 ±0.025  [0.414..0.685]  n=29
+sizes json.fast.stream-mt8  ruz 6331355   zstd 6324934
+json.fast.stream-mt8         2315       392  x 0.170 ±0.003  [0.165..0.228]  n=7
+sizes json.balanced.stream-mt8  ruz 4666485   zstd 5636749
+json.balanced.stream-mt8      366       109  x 0.302 ±0.019  [0.283..0.545]  n=3
+sizes json.best.stream-mt8  ruz 4635764   zstd 5498839
+json.best.stream-mt8          339        50  x 0.150 ±0.003  [0.129..0.153]  n=3
+sizes json.opt.stream-mt8  ruz 4473206   zstd 4481375
+json.opt.stream-mt8            32         6  x 0.202 ±0.001  [0.202..0.203]  n=2
+sizes json.ultra.stream-mt8  ruz 4526397   zstd 4522542
+json.ultra.stream-mt8          11         3  x 0.252 ±0.000  [0.252..0.253]  n=2
+ref                                 3668  (zstdx json.fastest bulk mt8 ceiling)
+ref                                 2384  (zstdx json.fast bulk mt8 ceiling)
+ref                                  436  (zstdx json.balanced bulk mt8 ceiling)
+ref                                   74  (zstdx json.best bulk mt8 ceiling)
+ref                                   20  (zstdx json.opt bulk mt8 ceiling)
+ref                                    8  (zstdx json.ultra bulk mt8 ceiling)
+sizes text.fastest.stream-mt8  ruz 108545   zstd 843554
+text.fastest.stream-mt8      8014      3474  x 0.441 ±0.086  [0.288..0.613]  n=56
+sizes text.fast.stream-mt8  ruz 100779   zstd 177384
+text.fast.stream-mt8         5654      1603  x 0.282 ±0.009  [0.236..0.330]  n=25
+sizes text.balanced.stream-mt8  ruz 87243   zstd 88698
+text.balanced.stream-mt8     1173       915  x 0.775 ±0.020  [0.734..0.958]  n=15
+sizes text.best.stream-mt8  ruz 86946   zstd 86976
+text.best.stream-mt8          309       302  x 0.982 ±0.169  [0.561..1.556]  n=5
+sizes text.opt.stream-mt8  ruz 82112   zstd 81839
+text.opt.stream-mt8           754       356  x 0.473 ±0.011  [0.459..0.550]  n=6
+sizes text.ultra.stream-mt8  ruz 81071   zstd 81074
+text.ultra.stream-mt8         421       226  x 0.535 ±0.009  [0.524..0.624]  n=4
+ref                                18957  (zstdx text.fastest bulk mt8 ceiling)
+ref                                13481  (zstdx text.fast bulk mt8 ceiling)
+ref                                 1260  (zstdx text.balanced bulk mt8 ceiling)
+ref                                  873  (zstdx text.best bulk mt8 ceiling)
+ref                                  659  (zstdx text.opt bulk mt8 ceiling)
+ref                                  412  (zstdx text.ultra bulk mt8 ceiling)
+sizes jsonreal.fastest.stream-mt8  ruz 4239270   zstd 4276812
+jsonreal.fastest.stream-mt8     1155      1840  x 1.634 ±0.096  [1.177..2.090]  n=18
+sizes jsonreal.fast.stream-mt8  ruz 3681521   zstd 3711853
+jsonreal.fast.stream-mt8     1081       627  x 0.579 ±0.009  [0.564..0.603]  n=10
+sizes jsonreal.balanced.stream-mt8  ruz 3134386   zstd 3163413
+jsonreal.balanced.stream-mt8      415       189  x 0.474 ±0.005  [0.441..0.478]  n=3
+sizes jsonreal.best.stream-mt8  ruz 2758476   zstd 3127129
+jsonreal.best.stream-mt8       94        73  x 0.761 ±0.057  [0.704..1.057]  n=3
+sizes jsonreal.opt.stream-mt8  ruz 2841222   zstd 2752562
+jsonreal.opt.stream-mt8        61        14  x 0.222 ±0.009  [0.211..0.231]  n=3
+sizes jsonreal.ultra.stream-mt8  ruz 2661585   zstd 2630970
+jsonreal.ultra.stream-mt8       25         7  x 0.263 ±0.001  [0.262..0.265]  n=2
+ref                                 1251  (zstdx jsonreal.fastest bulk mt8 ceiling)
+ref                                 1159  (zstdx jsonreal.fast bulk mt8 ceiling)
+ref                                  598  (zstdx jsonreal.balanced bulk mt8 ceiling)
+ref                                   36  (zstdx jsonreal.best bulk mt8 ceiling)
+ref                                   42  (zstdx jsonreal.opt bulk mt8 ceiling)
+ref                                   19  (zstdx jsonreal.ultra bulk mt8 ceiling)
+sizes textreal.fastest.stream-mt8  ruz 13565964   zstd 13691620
+textreal.fastest.stream-mt8      626      1491  x 2.481 ±0.283  [2.118..3.087]  n=10
+sizes textreal.fast.stream-mt8  ruz 11900067   zstd 11903904
+textreal.fast.stream-mt8      622       242  x 0.387 ±0.002  [0.376..0.392]  n=4
+sizes textreal.balanced.stream-mt8  ruz 10713397   zstd 10452953
+textreal.balanced.stream-mt8      113       130  x 1.141 ±0.007  [1.134..1.161]  n=3
+sizes textreal.best.stream-mt8  ruz 9907818   zstd 10089033
+textreal.best.stream-mt8       25        21  x 0.866 ±0.010  [0.857..1.009]  n=3
+sizes textreal.opt.stream-mt8  ruz 9601091   zstd 9342973
+textreal.opt.stream-mt8        18         5  x 0.276 ±0.012  [0.264..0.288]  n=2
+sizes textreal.ultra.stream-mt8  ruz 9319545   zstd 9112395
+textreal.ultra.stream-mt8       10         3  x 0.348 ±0.002  [0.346..0.350]  n=2
+ref                                  798  (zstdx textreal.fastest bulk mt8 ceiling)
+ref                                  779  (zstdx textreal.fast bulk mt8 ceiling)
+ref                                  175  (zstdx textreal.balanced bulk mt8 ceiling)
+ref                                    7  (zstdx textreal.best bulk mt8 ceiling)
+ref                                   13  (zstdx textreal.opt bulk mt8 ceiling)
+ref                                    7  (zstdx textreal.ultra bulk mt8 ceiling)
+sizes dll100.fastest.stream-mt8  ruz 24088252   zstd 47941003
+dll100.fastest.stream-mt8      909      1761  x 1.898 ±0.120  [1.736..2.019]  n=5
+sizes dll100.fast.stream-mt8  ruz 21043523   zstd 32860966
+dll100.fast.stream-mt8        844       422  x 0.499 ±0.002  [0.489..0.501]  n=3
+sizes dll100.balanced.stream-mt8  ruz 19751407   zstd 23781496
+dll100.balanced.stream-mt8      166       202  x 1.191 ±0.166  [1.024..1.374]  n=3
+sizes dll100.best.stream-mt8  ruz 20482494   zstd 23526330
+dll100.best.stream-mt8         50        70  x 1.413 ±0.164  [1.249..1.626]  n=3
+sizes dll100.opt.stream-mt8  ruz 20282928   zstd 20734497
+dll100.opt.stream-mt8          51        24  x 0.473 ±0.013  [0.460..0.486]  n=2
+sizes dll100.ultra.stream-mt8  ruz 19371225   zstd 19875808
+dll100.ultra.stream-mt8        27        17  x 0.625 ±0.017  [0.608..0.642]  n=2
+ref                                  999  (zstdx dll100.fastest bulk mt8 ceiling)
+ref                                  885  (zstdx dll100.fast bulk mt8 ceiling)
+ref                                  198  (zstdx dll100.balanced bulk mt8 ceiling)
+ref                                   51  (zstdx dll100.best bulk mt8 ceiling)
+ref                                   54  (zstdx dll100.opt bulk mt8 ceiling)
+ref                                   30  (zstdx dll100.ultra bulk mt8 ceiling)

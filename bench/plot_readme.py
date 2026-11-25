@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 """Regenerate the README performance figures in assets/ (SVG only).
 
-Streaming-first: real deployments stream (Read/Write), so the figures show
-the streaming paths; the bulk story lives in docs/src/dev/bench/.
+Real-corpus only: every figure cell comes from a real-world payload, so
+the synthetic json/text corpus shapes stay in the recorded ratio sweep
+for regression comparability but no longer feed a README figure.
 
 Data sources, all raw `matrix` logs tracked under bench/data/:
-- `pass-071/readme-dec.log` (`matrix --mode dec-st --pull
-  4k,16k,64k,256k,1m` plus the four dll100 .zst files) for the
-  streaming-decode rows, `pass-071/dec-mt.log` and `pass-071/files-dll.log`
-  for the MT-decode rows (against the zstd ST streaming reference)
-- `stream-ladder-20261124/` (`matrix --mode enc-stream --full-ladder
-  --no-mt --parallel 1 --shape json,text --file bench/big/dll100.raw`, the
-  `stream-ladder` section of bench/pass.sh) for the encode pareto, read
-  cell by cell: levels 1-22 on both sides at 64 KiB pulls
-- `pass-071/readme-enc.log` and `pass-071/readme-enc-dll.log` (`matrix
-  --mode enc-stream --mt-workers 8`) for the stream-mt8 figure
+- `pass-080/dec-st-real.log` (`matrix --mode dec-st --pull
+  4k,16k,64k,256k,1m` over jsonreal/textreal plus the four dll100 .zst
+  files) for the streaming-decode rows, `pass-080/dec-mt-real.log` and
+  `pass-080/files-dll.log` for the MT-decode rows (against the zstd ST
+  streaming reference)
+- `stream-ladder-20261126/stream-ladder.log` (`matrix --mode enc-stream
+  --full-ladder --no-mt --parallel 1 --shape json,text,jsonreal,textreal
+  --file bench/big/dll100.raw`, the `stream-ladder` section of
+  bench/pass.sh) for the encode pareto, read cell by cell: levels 1-22 on
+  both sides at 64 KiB pulls
+- `pass-080/enc-stream-mt8.log` (`matrix --mode enc-stream --mt-workers 8
+  --shape json,text,jsonreal,textreal --file bench/big/dll100.raw`) for
+  the stream-mt8 figure
 
-The encode pareto takes no cell from the release pass's ST sections: they
-ran two cells at a time, which moved zstdx's mid cells by up to 30 percent
-against serial (docs/src/dev/bench/methodology.md). The decode and the
-stream-mt8 sections never parallelize.
+The encode pareto takes no cell from a pass's parallel ST sections: two
+cells at a time move zstdx's mid cells by up to 30 percent against serial
+(docs/src/dev/bench/methodology.md). The decode and the stream-mt8
+sections never parallelize.
 
 The encode figure draws each side as a staircase, the throughput of its
 fastest level at every density, and shades the region between the two
-staircases that only one side reaches. A band label is the throughput
+staircases in the color of the side that leads there. A band label is
+the throughput
 multiple at equal density. It lies upright at the vertical center of its
 band, and adjacent bands too narrow for a label of their own share one
 that carries their range. Every level is a marker; the six tier levels
@@ -62,24 +67,28 @@ LEVELS = range(1, 23)
 TIERS = (1, 3, 9, 13, 17, 19)
 
 # Raw size of each encode payload; a log's frame sizes divide into ratios.
-RAW_BYTES = {"json": 32 << 20, "text": 32 << 20, "dll100": 100 << 20}
+RAW_BYTES = {"json": 32 << 20, "text": 32 << 20, "jsonreal": 32 << 20, "textreal": 32 << 20, "dll100": 100 << 20}
 
-# One encode panel: title, axis ranges and ticks. The levels join at
+# One encode panel: the payload name at the axes top, the corpus
+# provenance note above it. The levels join at
 # plot time from the stream ladder logs.
 ENCODE = {
-    "json": {
-        "title": "json · 32 MiB",
-        "xlim": (5.1, 7.6), "ylim": (0.8, 1100),
-        "xticks": (5.5, 6.0, 6.5, 7.0, 7.5), "yticks": (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000),
+    "jsonreal": {
+        "title": "json",
+        "note": "real corpus · GitHub Archive event JSON · 32 MiB",
+        "xlim": (7.5, 14.0), "ylim": (5, 1300),
+        "xticks": (8, 9, 10, 11, 12, 13, 14), "yticks": (5, 10, 20, 50, 100, 200, 500, 1000),
     },
-    "text": {
-        "title": "text · 32 MiB",
-        "xlim": (305, 417), "ylim": (40, 9000),
-        "xticks": (320, 340, 360, 380, 400), "yticks": (50, 100, 200, 500, 1000, 2000, 5000),
+    "textreal": {
+        "title": "text",
+        "note": "real corpus · Wikipedia XML (enwik8) · 32 MiB",
+        "xlim": (2.3, 3.95), "ylim": (2, 700),
+        "xticks": (2.5, 3.0, 3.5), "yticks": (2, 5, 10, 20, 50, 100, 200, 500),
     },
     "dll100": {
-        "title": "dll100 · 100 MiB",
-        "xlim": (2.0, 6.6), "ylim": (3, 900),
+        "title": "dll100",
+        "note": "system ELF binaries · 100 MiB",
+        "xlim": (2.0, 6.7), "ylim": (5, 900),
         "xticks": (3, 4, 5, 6), "yticks": (5, 10, 20, 50, 100, 200, 500),
     },
 }
@@ -95,18 +104,15 @@ NUMBER_SLOTS = ((7, 0), (7, 7), (7, -7), (0, 8), (0, -8), (-7, 0), (-7, 7), (-7,
 # Streaming-encode MT(8) speedup (ours/zstd throughput, both sides at 8
 # workers, 64 KiB pulls) per tier: payload -> (x at each of the 6 tiers).
 # Each value is the inverse of the harness's median per-round time ratio.
-# The dll100 cells trail libzstd's MT at three tiers and sit at 83-98% of
-# zstdx's own bulk-mt8 ceilings; balanced's low share is a placement
-# reading of its single-slowest-job wall (todo 17). The v0.7.1 opt-tier
-# DP work lifted the opt/ultra column (json opt 4.20 -> 4.65, json ultra
-# 3.30 -> 3.61, dll100 opt 2.00 -> 2.16, dll100 ultra 1.51 -> 1.58).
+# The best row carries the Dense-class verdict round: the binary payload's
+# wide ring collapsed the tier 27x before it (see matchers.md).
 ENCODE_MT = {
-    "fastest": {"json": 2.03, "text": 1.88, "dll100": 0.48},
-    "fast": {"json": 4.78, "text": 3.42, "dll100": 1.98},
-    "balanced": {"json": 3.33, "text": 1.27, "dll100": 0.89},
-    "best": {"json": 1.49, "text": 2.84, "dll100": 0.64},
-    "opt": {"json": 4.65, "text": 2.11, "dll100": 2.16},
-    "ultra": {"json": 3.61, "text": 1.28, "dll100": 1.58},
+    "fastest": {"jsonreal": 0.61, "textreal": 0.40, "dll100": 0.53},
+    "fast": {"jsonreal": 1.73, "textreal": 2.58, "dll100": 2.00},
+    "balanced": {"jsonreal": 2.11, "textreal": 0.88, "dll100": 0.84},
+    "best": {"jsonreal": 1.31, "textreal": 1.15, "dll100": 0.71},
+    "opt": {"jsonreal": 4.50, "textreal": 3.62, "dll100": 2.11},
+    "ultra": {"jsonreal": 3.80, "textreal": 2.87, "dll100": 1.60},
 }
 
 # Streaming-decode speedup (libzstd_time/ours_time) per corpus cell:
@@ -114,26 +120,19 @@ ENCODE_MT = {
 # mt16-vs-zstd-stream or None). Both sides single-threaded; the reader loop
 # pulls `pull` bytes per read. >1 = zstdx faster.
 DECODE = [
-    ("json zst1", (1.046, 1.054, 1.058), None),
-    ("json zst3", (1.085, 1.089, 1.098), None),
-    ("json zst9", (1.099, 1.102, 1.105), None),
-    ("json zst19", (1.027, 1.029, 1.036), None),
-    ("text zst1", (1.001, 1.004, 1.024), None),
-    ("text zst3", (0.991, 0.999, 1.022), None),
-    ("text zst9", (0.977, 0.979, 1.011), None),
-    ("text zst19", (0.952, 0.960, 1.010), None),
-    ("skewed zst1", (1.074, 1.079, 1.086), None),
-    ("skewed zst3", (1.060, 1.064, 1.068), None),
-    ("skewed zst9", (1.174, 1.176, 1.178), None),
-    ("skewed zst19", (0.979, 0.979, 1.013), None),
-    ("random zst3", (1.211, 1.232, 1.276), None),
-    ("zeros zst3", (0.989, 0.996, 1.031), None),
-    ("dll100 zst1", (0.988, 0.989, 0.995), None),
-    ("dll100 zst3", (1.038, 1.041, 1.042), None),
-    ("dll100 zst9", (1.035, 1.036, 1.045), None),
-    ("dll100 zst19", (1.043, 1.046, 1.053), None),
-    ("json zst3 · 16 threads", (None, 1.87, None), True),
-    ("dll100 zst3 · 16 threads", (None, 1.92, None), True),
+    ("jsonreal zst1", (1.066, 1.070, 1.077), None),
+    ("jsonreal zst3", (1.028, 1.035, 1.042), None),
+    ("jsonreal zst9", (1.029, 1.036, 1.039), None),
+    ("textreal zst1", (0.983, 0.985, 0.989), None),
+    ("textreal zst3", (0.896, 0.899, 0.903), None),
+    ("textreal zst9", (0.887, 0.893, 0.895), None),
+    ("dll100 zst1", (1.007, 1.015, 1.023), None),
+    ("dll100 zst3", (0.976, 0.980, 0.986), None),
+    ("dll100 zst9", (0.971, 0.976, 0.982), None),
+    ("dll100 zst19", (0.965, 0.970, 0.973), None),
+    ("jsonreal zst3 · 16 threads", (None, 1.45, None), True),
+    ("textreal zst3 · 16 threads", (None, 2.17, None), True),
+    ("dll100 zst3 · 16 threads", (None, 1.88, None), True),
 ]
 
 
@@ -175,7 +174,7 @@ def read_cells(*logs: Path) -> dict[str, Cell]:
 
 def load_encode() -> None:
     """Fill each encode panel with (ratio, MiB/s) per level, both sides."""
-    cells = read_cells(*sorted((DATA / "stream-ladder-20261124").glob("*.log")))
+    cells = read_cells(*sorted((DATA / "stream-ladder-20261126").glob("*.log")))
     for payload, cfg in ENCODE.items():
         cfg["zstdx"], cfg["libzstd"] = {}, {}
         raw = RAW_BYTES[payload]
@@ -503,19 +502,25 @@ def plot_encode() -> None:
         ax.set_axisbelow(True)
         ax.grid(axis="y", which="major", alpha=0.3, lw=0.5)
         ax.tick_params(labelsize=8.5)
-        ax.set_title(cfg["title"], fontsize=11)
+        # the payload name sits at the axes top; the provenance note rides
+        # above it as the axes title, lifted clear of the name by its pad
+        ax.set_title(cfg["note"], fontsize=7.5, color="#6b7283", pad=20)
+        ax.text(
+            0.5, 1.0, cfg["title"], transform=ax.transAxes,
+            ha="center", va="bottom", fontsize=11,
+        )
         ax.text(
             0.97, 0.95, "better ↗", transform=ax.transAxes, ha="right", va="top",
             fontsize=9, style="italic", color="#4b5563",
         )
-        ax.set_xlabel("compression ratio (higher is denser)", fontsize=9)
+        ax.set_xlabel("compression ratio", fontsize=9)
         panels.append((ax, cfg, rows))
     axes[0].set_ylabel("encode throughput (MiB/s, log)", fontsize=9)
     handles = [
         plt.Line2D([], [], ls="none", marker="o", ms=6, color=OURS, label="zstdx level 1–22"),
         plt.Line2D([], [], ls="none", marker="s", ms=6, color=ZSTD, label="libzstd level 1–22"),
-        mpatches.Patch(color=OURS_BAND, label="zstdx only"),
-        mpatches.Patch(color=ZSTD_BAND, label="libzstd only"),
+        mpatches.Patch(color=OURS_BAND, label="zstdx leads"),
+        mpatches.Patch(color=ZSTD_BAND, label="libzstd leads"),
     ]
     # title rides inside the legend block so constrained layout keeps them
     # together (a separate suptitle collides with the outside legend row)
@@ -525,8 +530,8 @@ def plot_encode() -> None:
         title="Streaming encode (64 KiB pulls): throughput vs compression ratio, single-threaded",
     )
     fig.supxlabel(
-        "shaded bands: density and throughput pairs that only one implementation reaches; "
-        "band labels: throughput multiple at equal density, a range when one label spans several bands\n"
+        "shaded bands: the throughput gap between the two sides at equal density, colored by the side that leads; "
+        "band labels: the throughput multiple at equal density, a range when one label spans several bands\n"
         "every level 1–22, single-threaded unknown-size streams at 64 KiB pulls, "
         "one cell on the machine at a time",
         fontsize=8, color="#6b7283",
@@ -547,11 +552,11 @@ def plot_encode() -> None:
 
 
 def plot_encode_mt() -> None:
-    payloads = {"json": "#1d4ed8", "text": "#3b82f6", "dll100": "#93c5fd"}
+    payloads = {"jsonreal": "#1d4ed8", "textreal": "#3b82f6", "dll100": "#93c5fd"}
     n = len(ENCODE_MT)
     fig, ax = plt.subplots(figsize=(9.6, 4.6), constrained_layout=True)
     ys = list(range(n, 0, -1))
-    jitter = {"json": 0.22, "text": 0.0, "dll100": -0.22}
+    jitter = {"jsonreal": 0.22, "textreal": 0.0, "dll100": -0.22}
     for (tier, vals), y in zip(ENCODE_MT.items(), ys):
         for payload, color in payloads.items():
             v = vals[payload]
@@ -595,7 +600,7 @@ def plot_encode_mt() -> None:
 
 def plot_decode() -> None:
     n = len(DECODE)
-    fig, ax = plt.subplots(figsize=(10.6, 7.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(10.6, 5.4), constrained_layout=True)
     ys = list(range(n, 0, -1))
     for (label, vals, mt), y in zip(DECODE, ys):
         if mt is not None:
@@ -618,7 +623,7 @@ def plot_decode() -> None:
                     fontsize=8.5, color="#111827")
     ax.axvline(1.0, color="#9ca3af", ls="--", lw=1.2, zorder=1)
     # markers clip silently when xlim outruns the data, so derive the right
-    # edge from the widest value on the chart (random 1.33x this pass)
+    # edge from the widest value on the chart (textreal mt16 2.2x this pass)
     xmax = max(
         max(vals[2] for _, vals, mt in DECODE if mt is None),
         max(vals[1] for _, vals, mt in DECODE if mt is not None),

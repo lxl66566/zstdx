@@ -1,0 +1,90 @@
+# ratio sweep: 48 cells (2 shapes x 6 levels x 4 modes), checksums off, parallel 16, mt-workers 4, ref zstd crate
+cell                              raw     zstdx        r      zstd        r       Δ%
+jsonreal.fastest.bulk-st     33554432   4224162     7.943    4253671     7.888    +0.70%
+jsonreal.fastest.bulk-mt     33554432   4245037     7.904    4276813     7.846    +0.75%
+jsonreal.fastest.stream-st   33554432   4224165     7.943    4254361     7.887    +0.71%
+jsonreal.fastest.stream-mt   33554432   4239270     7.915    4276812     7.846    +0.89%
+jsonreal.fast.bulk-st        33554432   3684504     9.107    3691265     9.090    +0.18%
+jsonreal.fast.bulk-mt        33554432   3669132     9.145    3711854     9.040    +1.16%
+jsonreal.fast.stream-st      33554432   3684507     9.107    3698550     9.072    +0.38%
+jsonreal.fast.stream-mt      33554432   3681521     9.114    3711853     9.040    +0.82%
+jsonreal.balanced.bulk-st    33554432   2828334    11.864    3139622    10.687   +11.01%
+jsonreal.balanced.bulk-mt    33554432   3012775    11.137    3163414    10.607    +5.00%
+jsonreal.balanced.stream-st  33554432   2828337    11.864    3141701    10.680   +11.08%
+jsonreal.balanced.stream-mt  33554432   3135529    10.701    3163413    10.607    +0.89%
+jsonreal.best.bulk-st        33554432   2749265    12.205    3105113    10.806   +12.94%
+jsonreal.best.bulk-mt        33554432   2749269    12.205    3127130    10.730   +13.74%
+jsonreal.best.stream-st      33554432   2749268    12.205    3106348    10.802   +12.99%
+jsonreal.best.stream-mt      33554432   2754919    12.180    3127129    10.730   +13.51%
+jsonreal.opt.bulk-st         33554432   2758683    12.163    2751723    12.194    -0.25%
+jsonreal.opt.bulk-mt         33554432   2803166    11.970    2752563    12.190    -1.81%
+jsonreal.opt.stream-st       33554432   2758686    12.163    2753306    12.187    -0.20%
+jsonreal.opt.stream-mt       33554432   2803165    11.970    2752562    12.190    -1.81%
+jsonreal.ultra.bulk-st       33554432   2631253    12.752    2630370    12.757    -0.03%
+jsonreal.ultra.bulk-mt       33554432   2646722    12.678    2630971    12.754    -0.60%
+jsonreal.ultra.stream-st     33554432   2631256    12.752    2632504    12.746    +0.05%
+jsonreal.ultra.stream-mt     33554432   2646721    12.678    2630970    12.754    -0.60%
+textreal.fastest.bulk-st     33554432  13561072     2.474   13687841     2.451    +0.93%
+textreal.fastest.bulk-mt     33554432  13567681     2.473   13691621     2.451    +0.91%
+textreal.fastest.stream-st   33554432  13561075     2.474   13688287     2.451    +0.94%
+textreal.fastest.stream-mt   33554432  13565964     2.473   13691620     2.451    +0.93%
+textreal.fast.bulk-st        33554432  11896929     2.820   11895743     2.821    -0.01%
+textreal.fast.bulk-mt        33554432  11901829     2.819   11903905     2.819    +0.02%
+textreal.fast.stream-st      33554432  11896932     2.820   11945274     2.809    +0.41%
+textreal.fast.stream-mt      33554432  11900067     2.820   11903904     2.819    +0.03%
+textreal.balanced.bulk-st    33554432  10379907     3.233   10442826     3.213    +0.61%
+textreal.balanced.bulk-mt    33554432  10480749     3.202   10452954     3.210    -0.27%
+textreal.balanced.stream-st  33554432  10379910     3.233   10445453     3.212    +0.63%
+textreal.balanced.stream-mt  33554432  10699368     3.136   10452953     3.210    -2.30%
+textreal.best.bulk-st        33554432   9746812     3.443   10076215     3.330    +3.38%
+textreal.best.bulk-mt        33554432   9746816     3.443   10089034     3.326    +3.51%
+textreal.best.stream-st      33554432   9746815     3.443   10078955     3.329    +3.41%
+textreal.best.stream-mt      33554432   9847162     3.408   10089033     3.326    +2.46%
+textreal.opt.bulk-st         33554432   9410389     3.566    9341776     3.592    -0.73%
+textreal.opt.bulk-mt         33554432   9500247     3.532    9342974     3.591    -1.66%
+textreal.opt.stream-st       33554432   9410392     3.566    9342835     3.591    -0.72%
+textreal.opt.stream-mt       33554432   9500246     3.532    9342973     3.591    -1.66%
+textreal.ultra.bulk-st       33554432   9111221     3.683    9111253     3.683    +0.00%
+textreal.ultra.bulk-mt       33554432   9226091     3.637    9112396     3.682    -1.23%
+textreal.ultra.stream-st     33554432   9111224     3.683    9112317     3.682    +0.01%
+textreal.ultra.stream-mt     33554432   9226090     3.637    9112395     3.682    -1.23%
+
+== summary ==
+-- per level, mode bulk-st (geo-mean Δ% over shapes) --
+fastest                    +0.82%
+fast                       +0.09%
+balanced                   +5.68%
+best                       +8.06%
+opt                        -0.49%
+ultra                      -0.02%
+-- per level, mode bulk-mt (geo-mean Δ% over shapes) --
+fastest                    +0.83%
+fast                       +0.59%
+balanced                   +2.33%
+best                       +8.51%
+opt                        -1.73%
+ultra                      -0.91%
+-- per level, mode stream-st (geo-mean Δ% over shapes) --
+fastest                    +0.83%
+fast                       +0.39%
+balanced                   +5.73%
+best                       +8.09%
+opt                        -0.46%
+ultra                      +0.03%
+-- per level, mode stream-mt (geo-mean Δ% over shapes) --
+fastest                    +0.91%
+fast                       +0.43%
+balanced                   -0.72%
+best                       +7.84%
+opt                        -1.73%
+ultra                      -0.91%
+-- per mode (geo-mean Δ% over cells) (geo-mean Δ%, + = denser than zstd) --
+bulk-st                    +2.30%
+bulk-mt                    +1.55%
+stream-st                  +2.38%
+stream-mt                  +0.92%
+-- per shape (geo-mean Δ% over cells) (geo-mean Δ%, + = denser than zstd) --
+jsonreal                   +3.26%
+textreal                   +0.34%
+geo-mean Δ over 48 comparisons: +1.79% | worst textreal.balanced.stream-mt (-2.30%) best jsonreal.best.bulk-mt (+13.74%) | wall 45.6s (parallel 16, mt-workers 4)
+sizes are deterministic: diff two runs (or two builds) to spot regressions

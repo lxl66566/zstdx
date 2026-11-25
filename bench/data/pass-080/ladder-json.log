@@ -1,0 +1,48 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T3 encode ST bulk, checksums off (interleaved A/B; MiB/s of raw) ==
+sizes json.l1  ruz   5232221 (r    6.41)   zstd   5495185 (r    6.11)
+json.l1                       630       812  x 1.291 ±0.001  [1.276..1.293]  n=10
+sizes json.l2  ruz   5254157 (r    6.39)   zstd   5860803 (r    5.73)
+json.l2                       555       656  x 1.183 ±0.002  [1.174..1.207]  n=9
+sizes json.l3  ruz   6336103 (r    5.30)   zstd   6339220 (r    5.29)
+json.l3                       464       472  x 1.017 ±0.001  [1.014..1.018]  n=8
+sizes json.l4  ruz   6344069 (r    5.29)   zstd   6350188 (r    5.28)
+json.l4                       441       426  x 0.968 ±0.005  [0.932..0.984]  n=7
+sizes json.l5  ruz   5730400 (r    5.86)   zstd   6022328 (r    5.57)
+json.l5                       205       265  x 1.294 ±0.003  [1.290..1.300]  n=4
+sizes json.l6  ruz   5063880 (r    6.63)   zstd   5829475 (r    5.76)
+json.l6                       147       187  x 1.268 ±0.001  [1.267..1.271]  n=3
+sizes json.l7  ruz   4974468 (r    6.75)   zstd   5749212 (r    5.84)
+json.l7                       125       160  x 1.269 ±0.009  [1.260..1.288]  n=3
+sizes json.l8  ruz   4684828 (r    7.16)   zstd   5599426 (r    5.99)
+json.l8                       101       124  x 1.224 ±0.003  [1.216..1.227]  n=3
+sizes json.l9  ruz   4661008 (r    7.20)   zstd   5639335 (r    5.95)
+json.l9                       147       113  x 0.776 ±0.005  [0.766..0.782]  n=3
+sizes json.l10  ruz   4674100 (r    7.18)   zstd   5566726 (r    6.03)
+json.l10                       67        83  x 1.231 ±0.033  [1.198..1.277]  n=3
+sizes json.l11  ruz   4629213 (r    7.25)   zstd   5519273 (r    6.08)
+json.l11                       51        57  x 1.116 ±0.036  [1.078..1.152]  n=3
+sizes json.l12  ruz   4629698 (r    7.25)   zstd   5517458 (r    6.08)
+json.l12                       45        46  x 1.030 ±0.037  [0.935..1.067]  n=3
+sizes json.l13  ruz   4635395 (r    7.24)   zstd   5500580 (r    6.10)
+json.l13                       71        29  x 0.401 ±0.011  [0.389..0.412]  n=3
+sizes json.l14  ruz   4635541 (r    7.24)   zstd   5474371 (r    6.13)
+json.l14                       57        20  x 0.355 ±0.013  [0.334..0.369]  n=3
+sizes json.l15  ruz   4635258 (r    7.24)   zstd   5444664 (r    6.16)
+json.l15                       61        12  x 0.196 ±0.005  [0.189..0.201]  n=3
+sizes json.l16  ruz   4594108 (r    7.30)   zstd   4725236 (r    7.10)
+json.l16                        8         8  x 0.990 ±0.009  [0.982..0.999]  n=2
+sizes json.l17  ruz   4487001 (r    7.48)   zstd   4481382 (r    7.49)
+json.l17                        7         5  x 0.800 ±0.009  [0.791..0.809]  n=2
+sizes json.l18  ruz   4519168 (r    7.42)   zstd   4521676 (r    7.42)
+json.l18                        3         4  x 1.041 ±0.008  [1.033..1.049]  n=2
+sizes json.l19  ruz   4519442 (r    7.42)   zstd   4522548 (r    7.42)
+json.l19                        3         2  x 0.886 ±0.003  [0.883..0.889]  n=2
+sizes json.l20  ruz   4522372 (r    7.42)   zstd   4530090 (r    7.41)
+json.l20                        3         2  x 0.734 ±0.005  [0.728..0.739]  n=2
+sizes json.l21  ruz   4526339 (r    7.41)   zstd   4530612 (r    7.41)
+json.l21                        2         2  x 0.818 ±0.010  [0.808..0.828]  n=2
+sizes json.l22  ruz   4527481 (r    7.41)   zstd   4530482 (r    7.41)
+json.l22                        2         1  x 0.530 ±0.021  [0.510..0.551]  n=2
+-- checksum overhead (ours; A/B = off/on time ratio) --
+json.fast.cksum-on/off        454       473  x 1.041 ±0.002  [1.037..1.051]  n=8

@@ -1,0 +1,47 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T3 encode ST bulk, checksums off (interleaved A/B; MiB/s of raw) ==
+sizes zeros.l1  ruz      1030 (r 32577.12)   zstd      1043 (r 32171.08)
+zeros.l1                    42257      9901  x 0.234 ±0.015  [0.127..0.338]  n=149
+sizes zeros.l2  ruz      1030 (r 32577.12)   zstd      1043 (r 32171.08)
+zeros.l2                    43914      9939  x 0.226 ±0.013  [0.133..0.294]  n=149
+sizes zeros.l3  ruz      1030 (r 32577.12)   zstd      1043 (r 32171.08)
+zeros.l3                    46467      8490  x 0.183 ±0.006  [0.084..0.609]  n=129
+sizes zeros.l4  ruz      1030 (r 32577.12)   zstd      1043 (r 32171.08)
+zeros.l4                    46421      8404  x 0.182 ±0.005  [0.120..0.684]  n=130
+sizes zeros.l5  ruz      1030 (r 32577.12)   zstd      1043 (r 32171.08)
+zeros.l5                    44063      6293  x 0.142 ±0.006  [0.090..0.766]  n=97
+sizes zeros.l6  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l6                    44325      2772  x 0.062 ±0.003  [0.059..0.367]  n=44
+sizes zeros.l7  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l7                    43638      2747  x 0.063 ±0.003  [0.048..0.091]  n=43
+sizes zeros.l8  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l8                    40736      1764  x 0.043 ±0.007  [0.034..0.071]  n=37
+sizes zeros.l9  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l9                    31185      1743  x 0.055 ±0.003  [0.049..0.065]  n=30
+sizes zeros.l10  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l10                   40671      1694  x 0.041 ±0.002  [0.037..0.262]  n=29
+sizes zeros.l11  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l11                   39770      1677  x 0.042 ±0.003  [0.033..0.076]  n=38
+sizes zeros.l12  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l12                   40429       887  x 0.022 ±0.001  [0.019..0.096]  n=36
+sizes zeros.l13  ruz      1030 (r 32577.12)   zstd      1043 (r 32171.08)
+zeros.l13                   32258       623  x 0.019 ±0.001  [0.018..0.049]  n=30
+sizes zeros.l14  ruz      1030 (r 32577.12)   zstd      1043 (r 32171.08)
+zeros.l14                   32499       547  x 0.017 ±0.001  [0.015..0.043]  n=30
+sizes zeros.l15  ruz      1030 (r 32577.12)   zstd      1043 (r 32171.08)
+zeros.l15                   32643       478  x 0.015 ±0.000  [0.013..0.027]  n=29
+sizes zeros.l16  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l16                   41982       988  x 0.024 ±0.001  [0.022..0.125]  n=32
+sizes zeros.l17  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l17                   40525       816  x 0.020 ±0.002  [0.017..0.292]  n=26
+sizes zeros.l18  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l18                   34465       786  x 0.023 ±0.003  [0.017..0.292]  n=15
+sizes zeros.l19  ruz      1030 (r 32577.12)   zstd      1042 (r 32201.95)
+zeros.l19                   32953       593  x 0.018 ±0.002  [0.014..0.022]  n=33
+sizes zeros.l20  ruz      1030 (r 32577.12)   zstd      1041 (r 32232.88)
+zeros.l20                   31811       353  x 0.011 ±0.001  [0.008..0.070]  n=19
+sizes zeros.l21  ruz      1030 (r 32577.12)   zstd      1041 (r 32232.88)
+zeros.l21                   27770       202  x 0.007 ±0.001  [0.005..0.035]  n=22
+sizes zeros.l22  ruz      1030 (r 32577.12)   zstd      1041 (r 32232.88)
+zeros.l22                   31826       175  x 0.005 ±0.001  [0.004..0.011]  n=30
+-- checksum overhead (ours; A/B = off/on time ratio) --

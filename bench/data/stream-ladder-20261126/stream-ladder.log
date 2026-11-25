@@ -1,0 +1,222 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 1
+== T5 encode streaming ST, checksums off (interleaved A/B; 64 KiB pulls) ==
+sizes json.l1.stream  ruz 5232182   zstd 5495184
+json.l1.stream                619       750  x 1.213 ±0.005  [1.208..1.639]  n=9
+sizes json.l2.stream  ruz 5254157   zstd 5860803
+json.l2.stream                544       598  x 1.100 ±0.003  [1.095..1.105]  n=9
+sizes json.l3.stream  ruz 6336103   zstd 6389264
+json.l3.stream                466       437  x 0.935 ±0.001  [0.898..0.947]  n=7
+sizes json.l4.stream  ruz 6344069   zstd 6404319
+json.l4.stream                455       421  x 0.924 ±0.003  [0.921..0.934]  n=7
+sizes json.l5.stream  ruz 5730400   zstd 6022347
+json.l5.stream                208       240  x 1.157 ±0.005  [1.149..1.166]  n=4
+sizes json.l6.stream  ruz 5063880   zstd 5829477
+json.l6.stream                148       166  x 1.117 ±0.012  [1.105..1.143]  n=3
+sizes json.l7.stream  ruz 4974468   zstd 5749212
+json.l7.stream                125       140  x 1.122 ±0.004  [1.106..1.126]  n=3
+sizes json.l8.stream  ruz 4684828   zstd 5599431
+json.l8.stream                101       107  x 1.068 ±0.004  [1.057..1.073]  n=3
+sizes json.l9.stream  ruz 4661008   zstd 5639351
+json.l9.stream                161       103  x 0.643 ±0.003  [0.640..0.675]  n=3
+sizes json.l10.stream  ruz 4674100   zstd 5566728
+json.l10.stream                76        74  x 0.971 ±0.028  [0.869..0.999]  n=3
+sizes json.l11.stream  ruz 4629213   zstd 5519281
+json.l11.stream                56        54  x 0.909 ±0.031  [0.878..0.965]  n=3
+sizes json.l12.stream  ruz 4629698   zstd 5517459
+json.l12.stream                47        47  x 1.005 ±0.034  [0.915..1.039]  n=3
+sizes json.l13.stream  ruz 4635395   zstd 5500578
+json.l13.stream                77        33  x 0.427 ±0.019  [0.408..0.452]  n=3
+sizes json.l14.stream  ruz 4635541   zstd 5474377
+json.l14.stream                74        25  x 0.334 ±0.006  [0.324..0.341]  n=3
+sizes json.l15.stream  ruz 4635258   zstd 5444704
+json.l15.stream                74        15  x 0.206 ±0.000  [0.206..0.206]  n=3
+sizes json.l16.stream  ruz 4594108   zstd 4660887
+json.l16.stream                10         9  x 0.960 ±0.001  [0.958..0.961]  n=2
+sizes json.l17.stream  ruz 4487001   zstd 4482274
+json.l17.stream                 8         6  x 0.760 ±0.003  [0.757..0.764]  n=2
+sizes json.l18.stream  ruz 4519168   zstd 4522277
+json.l18.stream                 4         4  x 0.967 ±0.001  [0.966..0.967]  n=2
+sizes json.l19.stream  ruz 4519442   zstd 4524530
+json.l19.stream                 3         3  x 0.834 ±0.002  [0.832..0.835]  n=2
+sizes json.l20.stream  ruz 4522372   zstd 4530086
+json.l20.stream                 3         2  x 0.709 ±0.001  [0.708..0.710]  n=2
+sizes json.l21.stream  ruz 4526339   zstd 4530609
+json.l21.stream                 3         2  x 0.765 ±0.016  [0.750..0.781]  n=2
+sizes json.l22.stream  ruz 4527481   zstd 4530471
+json.l22.stream                 2         1  x 0.465 ±0.007  [0.457..0.472]  n=2
+sizes text.l1.stream  ruz 108512   zstd 1838306
+text.l1.stream               7191      1720  x 0.239 ±0.005  [0.230..0.314]  n=27
+sizes text.l2.stream  ruz 107360   zstd 106244
+text.l2.stream               7359      5826  x 0.792 ±0.010  [0.768..0.870]  n=91
+sizes text.l3.stream  ruz 100758   zstd 100794
+text.l3.stream               6987      5153  x 0.736 ±0.014  [0.654..0.946]  n=80
+sizes text.l4.stream  ruz 100689   zstd 100693
+text.l4.stream               6520      5083  x 0.776 ±0.011  [0.735..0.960]  n=79
+sizes text.l5.stream  ruz 94241   zstd 93791
+text.l5.stream               4745      3197  x 0.671 ±0.013  [0.629..0.746]  n=50
+sizes text.l6.stream  ruz 91301   zstd 90766
+text.l6.stream               4096      2523  x 0.615 ±0.012  [0.586..0.679]  n=40
+sizes text.l7.stream  ruz 90057   zstd 89614
+text.l7.stream               3767      2406  x 0.640 ±0.009  [0.617..0.727]  n=38
+sizes text.l8.stream  ruz 89477   zstd 88762
+text.l8.stream               3297      1673  x 0.505 ±0.010  [0.442..0.643]  n=26
+sizes text.l9.stream  ruz 87234   zstd 88722
+text.l9.stream               1496      1592  x 1.068 ±0.006  [1.059..1.087]  n=24
+sizes text.l10.stream  ruz 88611   zstd 87936
+text.l10.stream              2506      1454  x 0.583 ±0.006  [0.557..0.600]  n=23
+sizes text.l11.stream  ruz 88128   zstd 87496
+text.l11.stream              2194      1410  x 0.640 ±0.005  [0.578..0.647]  n=22
+sizes text.l12.stream  ruz 88120   zstd 87486
+text.l12.stream              2062       753  x 0.364 ±0.003  [0.337..0.375]  n=12
+sizes text.l13.stream  ruz 86919   zstd 87011
+text.l13.stream              1004       609  x 0.609 ±0.003  [0.590..0.621]  n=10
+sizes text.l14.stream  ruz 86464   zstd 86516
+text.l14.stream               868       511  x 0.589 ±0.006  [0.573..0.620]  n=8
+sizes text.l15.stream  ruz 86270   zstd 86331
+text.l15.stream               831       411  x 0.497 ±0.003  [0.456..0.548]  n=7
+sizes text.l16.stream  ruz 82136   zstd 82653
+text.l16.stream               881       479  x 0.544 ±0.002  [0.535..0.552]  n=8
+sizes text.l17.stream  ruz 82076   zstd 81841
+text.l17.stream               873       401  x 0.458 ±0.002  [0.453..0.462]  n=7
+sizes text.l18.stream  ruz 81175   zstd 81285
+text.l18.stream               515       344  x 0.664 ±0.003  [0.660..0.670]  n=6
+sizes text.l19.stream  ruz 81028   zstd 81076
+text.l19.stream               481       243  x 0.505 ±0.002  [0.501..0.518]  n=4
+sizes text.l20.stream  ruz 81028   zstd 81074
+text.l20.stream               314       175  x 0.559 ±0.002  [0.549..0.560]  n=3
+sizes text.l21.stream  ruz 81014   zstd 81052
+text.l21.stream               314       122  x 0.389 ±0.004  [0.385..0.402]  n=3
+sizes text.l22.stream  ruz 81010   zstd 81042
+text.l22.stream               311        72  x 0.232 ±0.002  [0.231..0.234]  n=3
+sizes jsonreal.l1.stream  ruz 4224165   zstd 4254361
+jsonreal.l1.stream            785       996  x 1.268 ±0.002  [1.264..1.302]  n=13
+sizes jsonreal.l2.stream  ruz 4161367   zstd 4016039
+jsonreal.l2.stream            771       879  x 1.140 ±0.004  [1.132..1.158]  n=12
+sizes jsonreal.l3.stream  ruz 3684507   zstd 3698550
+jsonreal.l3.stream            770       741  x 0.962 ±0.001  [0.960..0.971]  n=12
+sizes jsonreal.l4.stream  ruz 3667974   zstd 3681317
+jsonreal.l4.stream            687       672  x 0.978 ±0.001  [0.965..0.980]  n=11
+sizes jsonreal.l5.stream  ruz 3483671   zstd 3512267
+jsonreal.l5.stream            355       354  x 0.997 ±0.003  [0.986..1.001]  n=6
+sizes jsonreal.l6.stream  ruz 3348279   zstd 3396405
+jsonreal.l6.stream            273       274  x 1.002 ±0.001  [1.001..1.020]  n=5
+sizes jsonreal.l7.stream  ruz 3300005   zstd 3350408
+jsonreal.l7.stream            234       243  x 1.038 ±0.026  [1.012..1.097]  n=4
+sizes jsonreal.l8.stream  ruz 3265816   zstd 3297330
+jsonreal.l8.stream            196       197  x 1.006 ±0.006  [0.963..1.016]  n=4
+sizes jsonreal.l9.stream  ruz 2828337   zstd 3141701
+jsonreal.l9.stream            199       201  x 1.010 ±0.001  [1.003..1.011]  n=4
+sizes jsonreal.l10.stream  ruz 3057389   zstd 3120184
+jsonreal.l10.stream           151       152  x 1.003 ±0.008  [0.894..1.011]  n=3
+sizes jsonreal.l11.stream  ruz 3051543   zstd 3110796
+jsonreal.l11.stream           128       116  x 0.872 ±0.018  [0.854..0.946]  n=3
+sizes jsonreal.l12.stream  ruz 3050092   zstd 3110392
+jsonreal.l12.stream           105        94  x 0.899 ±0.034  [0.826..0.932]  n=3
+sizes jsonreal.l13.stream  ruz 2749268   zstd 3106348
+jsonreal.l13.stream            37        46  x 1.212 ±0.005  [1.207..1.242]  n=3
+sizes jsonreal.l14.stream  ruz 2738242   zstd 3086570
+jsonreal.l14.stream            27        34  x 1.265 ±0.005  [1.260..1.281]  n=3
+sizes jsonreal.l15.stream  ruz 2738094   zstd 3060689
+jsonreal.l15.stream            20        22  x 1.112 ±0.002  [1.110..1.123]  n=3
+sizes jsonreal.l16.stream  ruz 2966559   zstd 2993002
+jsonreal.l16.stream            17        18  x 1.022 ±0.008  [1.014..1.033]  n=3
+sizes jsonreal.l17.stream  ruz 2758686   zstd 2753306
+jsonreal.l17.stream            16        13  x 0.828 ±0.013  [0.815..0.842]  n=2
+sizes jsonreal.l18.stream  ruz 2722468   zstd 2736949
+jsonreal.l18.stream            10        10  x 1.006 ±0.004  [1.002..1.010]  n=2
+sizes jsonreal.l19.stream  ruz 2631256   zstd 2632504
+jsonreal.l19.stream             8         6  x 0.734 ±0.002  [0.732..0.735]  n=2
+sizes jsonreal.l20.stream  ruz 2531666   zstd 2474956
+jsonreal.l20.stream             8         6  x 0.698 ±0.003  [0.694..0.701]  n=2
+sizes jsonreal.l21.stream  ruz 2475900   zstd 2468334
+jsonreal.l21.stream             7         4  x 0.632 ±0.001  [0.631..0.634]  n=2
+sizes jsonreal.l22.stream  ruz 2474488   zstd 2466582
+jsonreal.l22.stream             7         3  x 0.474 ±0.001  [0.473..0.475]  n=2
+sizes textreal.l1.stream  ruz 13561075   zstd 13688287
+textreal.l1.stream            244       421  x 1.730 ±0.003  [1.726..1.799]  n=4
+sizes textreal.l2.stream  ruz 13005258   zstd 12545899
+textreal.l2.stream            228       324  x 1.422 ±0.001  [1.418..1.424]  n=4
+sizes textreal.l3.stream  ruz 11896932   zstd 11945274
+textreal.l3.stream            266       250  x 0.943 ±0.001  [0.940..0.944]  n=4
+sizes textreal.l4.stream  ruz 11647663   zstd 11710290
+textreal.l4.stream            233       220  x 0.942 ±0.001  [0.908..0.943]  n=4
+sizes textreal.l5.stream  ruz 11384882   zstd 11317150
+textreal.l5.stream            139       148  x 1.063 ±0.003  [1.060..1.066]  n=3
+sizes textreal.l6.stream  ruz 11001817   zstd 10955548
+textreal.l6.stream             93       104  x 1.119 ±0.005  [1.111..1.124]  n=3
+sizes textreal.l7.stream  ruz 10775334   zstd 10743332
+textreal.l7.stream             80        88  x 1.096 ±0.003  [1.085..1.099]  n=3
+sizes textreal.l8.stream  ruz 10647382   zstd 10609788
+textreal.l8.stream             62        67  x 1.083 ±0.011  [1.073..1.111]  n=3
+sizes textreal.l9.stream  ruz 10379910   zstd 10445453
+textreal.l9.stream             57        65  x 1.138 ±0.011  [1.121..1.148]  n=3
+sizes textreal.l10.stream  ruz 10332562   zstd 10297505
+textreal.l10.stream            45        45  x 1.013 ±0.004  [1.009..1.028]  n=3
+sizes textreal.l11.stream  ruz 10265057   zstd 10227704
+textreal.l11.stream            36        33  x 0.935 ±0.006  [0.884..0.941]  n=3
+sizes textreal.l12.stream  ruz 10238311   zstd 10203000
+textreal.l12.stream            30        28  x 0.928 ±0.001  [0.888..0.929]  n=3
+sizes textreal.l13.stream  ruz 9746815   zstd 10078955
+textreal.l13.stream             7        14  x 1.966 ±0.019  [1.947..1.985]  n=2
+sizes textreal.l14.stream  ruz 9616502   zstd 10020642
+textreal.l14.stream             5        11  x 2.325 ±0.003  [2.322..2.329]  n=2
+sizes textreal.l15.stream  ruz 9590249   zstd 9908938
+textreal.l15.stream             4         7  x 1.815 ±0.011  [1.804..1.827]  n=2
+sizes textreal.l16.stream  ruz 9491267   zstd 9569383
+textreal.l16.stream             7         7  x 1.122 ±0.011  [1.112..1.133]  n=2
+sizes textreal.l17.stream  ruz 9410392   zstd 9342835
+textreal.l17.stream             6         5  x 0.771 ±0.003  [0.768..0.774]  n=2
+sizes textreal.l18.stream  ruz 9117519   zstd 9219042
+textreal.l18.stream             3         4  x 1.103 ±0.004  [1.099..1.107]  n=2
+sizes textreal.l19.stream  ruz 9111224   zstd 9112317
+textreal.l19.stream             3         3  x 0.906 ±0.006  [0.901..0.912]  n=2
+sizes textreal.l20.stream  ruz 9022926   zstd 8904624
+textreal.l20.stream             3         3  x 0.821 ±0.001  [0.820..0.822]  n=2
+sizes textreal.l21.stream  ruz 8905281   zstd 8882629
+textreal.l21.stream             3         3  x 0.904 ±0.002  [0.902..0.905]  n=2
+sizes textreal.l22.stream  ruz 8904906   zstd 8882245
+textreal.l22.stream             3         2  x 0.803 ±0.002  [0.801..0.806]  n=2
+sizes dll100.l1.stream  ruz 24066447   zstd 47915177
+dll100.l1.stream              507       487  x 0.961 ±0.001  [0.891..0.962]  n=3
+sizes dll100.l2.stream  ruz 23614974   zstd 43761158
+dll100.l2.stream              488       414  x 0.850 ±0.001  [0.849..0.871]  n=3
+sizes dll100.l3.stream  ruz 21047605   zstd 30594727
+dll100.l3.stream              443       388  x 0.876 ±0.005  [0.870..0.881]  n=3
+sizes dll100.l4.stream  ruz 20821114   zstd 30020095
+dll100.l4.stream              379       332  x 0.876 ±0.019  [0.817..0.895]  n=3
+sizes dll100.l5.stream  ruz 29120172   zstd 30131104
+dll100.l5.stream              206       221  x 1.077 ±0.005  [1.072..1.099]  n=3
+sizes dll100.l6.stream  ruz 28324150   zstd 27958417
+dll100.l6.stream              155       168  x 1.081 ±0.000  [1.081..1.082]  n=3
+sizes dll100.l7.stream  ruz 27978959   zstd 27644751
+dll100.l7.stream              136       148  x 1.088 ±0.005  [1.084..1.097]  n=3
+sizes dll100.l8.stream  ruz 27844729   zstd 27455505
+dll100.l8.stream              109       119  x 1.093 ±0.000  [1.087..1.094]  n=3
+sizes dll100.l9.stream  ruz 19570847   zstd 22832690
+dll100.l9.stream              151       136  x 0.898 ±0.020  [0.869..0.918]  n=3
+sizes dll100.l10.stream  ruz 23029085   zstd 22702877
+dll100.l10.stream              94        99  x 1.055 ±0.007  [1.049..1.096]  n=3
+sizes dll100.l11.stream  ruz 22966534   zstd 22640831
+dll100.l11.stream              79        74  x 0.941 ±0.001  [0.940..0.971]  n=3
+sizes dll100.l12.stream  ruz 22951380   zstd 22627244
+dll100.l12.stream              60        61  x 1.011 ±0.001  [0.998..1.012]  n=3
+sizes dll100.l13.stream  ruz 19565857   zstd 22575243
+dll100.l13.stream              33        35  x 1.089 ±0.009  [1.080..1.098]  n=2
+sizes dll100.l14.stream  ruz 19509294   zstd 22523107
+dll100.l14.stream              27        28  x 1.055 ±0.007  [1.048..1.062]  n=2
+sizes dll100.l15.stream  ruz 19490774   zstd 22454123
+dll100.l15.stream              24        21  x 0.870 ±0.007  [0.863..0.878]  n=2
+sizes dll100.l16.stream  ruz 17411925   zstd 21660921
+dll100.l16.stream              16        17  x 1.081 ±0.009  [1.072..1.090]  n=2
+sizes dll100.l17.stream  ruz 17398453   zstd 20746472
+dll100.l17.stream              16        13  x 0.815 ±0.003  [0.811..0.818]  n=2
+sizes dll100.l18.stream  ruz 16611512   zstd 19943777
+dll100.l18.stream              10         9  x 0.959 ±0.007  [0.952..0.966]  n=2
+sizes dll100.l19.stream  ruz 16584148   zstd 19889926
+dll100.l19.stream               9         8  x 0.879 ±0.026  [0.853..0.906]  n=2
+sizes dll100.l20.stream  ruz 19144805   zstd 18820357
+dll100.l20.stream               9         7  x 0.780 ±0.003  [0.777..0.783]  n=2
+sizes dll100.l21.stream  ruz 18825123   zstd 16526761
+dll100.l21.stream               9         7  x 0.818 ±0.003  [0.814..0.821]  n=2
+sizes dll100.l22.stream  ruz 16585229   zstd 16458181
+dll100.l22.stream               8         5  x 0.625 ±0.001  [0.624..0.626]  n=2

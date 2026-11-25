@@ -1,0 +1,47 @@
+# bench matrix: zstdx vs zstd crate (libzstd 1.6.0, binding 10600), 32 cores, st cells parallel 2
+== T3 encode ST bulk, checksums off (interleaved A/B; MiB/s of raw) ==
+sizes random.l1  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l1                    1993      1897  x 0.955 ±0.042  [0.798..1.118]  n=30
+sizes random.l2  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l2                    2010      1881  x 0.927 ±0.023  [0.806..1.222]  n=29
+sizes random.l3  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l3                    1955      1818  x 0.934 ±0.026  [0.774..1.172]  n=28
+sizes random.l4  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l4                    2042      1899  x 0.931 ±0.023  [0.822..1.001]  n=30
+sizes random.l5  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l5                    2305      1724  x 0.748 ±0.022  [0.679..0.881]  n=27
+sizes random.l6  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l6                    2215      1669  x 0.751 ±0.007  [0.727..0.765]  n=27
+sizes random.l7  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l7                    2242      1606  x 0.714 ±0.010  [0.647..0.788]  n=26
+sizes random.l8  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l8                    2253      1667  x 0.739 ±0.015  [0.702..0.762]  n=27
+sizes random.l9  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l9                    2244      1393  x 0.621 ±0.006  [0.523..0.637]  n=22
+sizes random.l10  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l10                   2261       898  x 0.405 ±0.008  [0.363..0.420]  n=15
+sizes random.l11  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l11                   2212      1113  x 0.500 ±0.012  [0.464..0.516]  n=18
+sizes random.l12  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l12                   1964       514  x 0.255 ±0.015  [0.236..0.306]  n=9
+sizes random.l13  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l13                   2112       122  x 0.054 ±0.002  [0.052..0.067]  n=3
+sizes random.l14  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l14                   2109        76  x 0.036 ±0.003  [0.033..0.040]  n=3
+sizes random.l15  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l15                   2129        72  x 0.034 ±0.001  [0.028..0.034]  n=3
+sizes random.l16  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l16                   2085        12  x 0.006 ±0.000  [0.005..0.006]  n=3
+sizes random.l17  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l17                   2222         9  x 0.004 ±0.000  [0.003..0.004]  n=3
+sizes random.l18  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l18                   3311         7  x 0.002 ±0.001  [0.001..0.003]  n=4
+sizes random.l19  ruz  33555206 (r    1.00)   zstd  33555210 (r    1.00)
+random.l19                   3432         6  x 0.002 ±0.001  [0.001..0.003]  n=4
+sizes random.l20  ruz  33555206 (r    1.00)   zstd  33555209 (r    1.00)
+random.l20                   2264         5  x 0.002 ±0.000  [0.002..0.002]  n=3
+sizes random.l21  ruz  33555206 (r    1.00)   zstd  33555209 (r    1.00)
+random.l21                   2228         7  x 0.003 ±0.000  [0.003..0.003]  n=3
+sizes random.l22  ruz  33555206 (r    1.00)   zstd  33555209 (r    1.00)
+random.l22                   2224         9  x 0.004 ±0.000  [0.003..0.004]  n=3
+-- checksum overhead (ours; A/B = off/on time ratio) --

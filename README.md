@@ -53,21 +53,21 @@ Without `std` the crate builds as `no_std` with `alloc`. Bulk, streaming and the
 
 ## Performance
 
-Benchmarks compare against the `zstd` crate (libzstd 1.5.7) on 32 MiB corpus shapes plus a 100 MiB binary payload ([gen_big.sh](https://github.com/lxl66566/zstdx/blob/main/bench/gen_big.sh)). Each cell runs single-threaded with checksums off unless noted, and passes a roundtrip check. Run-to-run noise is ±10%. A speedup of 3.1x means zstdx finishes in about a third of the reference time. The figures cover the streaming paths, and the full tables including bulk are in [snapshot.md](https://github.com/lxl66566/zstdx/blob/main/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/main/docs/src/dev/bench/matrix.md).
+Benchmarks compare against the `zstd` crate (libzstd 1.6.0) on real-world payloads: an hour of GitHub Archive event JSON (`jsonreal`), 32 MiB of the Wikipedia XML dump (`textreal`), and a 100 MiB system-binary mix (`dll100`, [gen_big.sh](https://github.com/lxl66566/zstdx/blob/main/bench/gen_big.sh)). Each cell runs single-threaded with checksums off unless noted, and passes a roundtrip check. Run-to-run noise is ±10%. A speedup of 3.1x means zstdx finishes in about a third of the reference time. The figures cover the streaming paths, and the full tables including bulk and the synthetic regression corpus are in [snapshot.md](https://github.com/lxl66566/zstdx/blob/main/docs/src/dev/bench/snapshot.md) and [matrix.md](https://github.com/lxl66566/zstdx/blob/main/docs/src/dev/bench/matrix.md).
 
 ![Streaming encode: throughput vs compression ratio, zstdx vs libzstd](https://raw.githubusercontent.com/lxl66566/zstdx/main/assets/encode-pareto.svg)
 
-Each marker is one compression level from 1 to 22. The line under a side is the throughput of its fastest level at that density, and the shaded areas are reachable by one side only. A band label gives the throughput gap at equal density. On unknown-size text streams libzstd's level 1 falls to ratio 18.3, which places its marker at the left edge.
+Each marker is one compression level from 1 to 22. The line under a side is the throughput of its fastest level at that density, the shading is colored by the side that leads there, and a band label gives the throughput gap at equal density.
 
-Streaming encode makes the smaller frame at 47 of the 66 matched level and payload pairs. On json, level 9 is 1.5x faster at a 21% higher ratio, and between ratios 6.2 and 6.4 the fastest libzstd level runs at 9 MiB/s where zstdx's level 1 runs at 623 MiB/s. On the dll payload, levels 1 to 4 emit 31% to 50% fewer bytes at 1.0x to 1.2x the speed, and levels 13 to 19 emit 13% to 20% fewer bytes. Every text level sits on or above the libzstd frontier. Where a matched level is slower, it still emits the smaller frame or stays within 2% of the libzstd size. Across the full sweep of 5 shapes, 6 levels, both APIs and both threading modes, the geometric mean ratio is 8.7% denser than libzstd at matched levels.
+On the real payloads zstdx emits the smaller frame at the majority of matched levels: 17 of 22 on jsonreal, 13 of 22 on the dll mix and 10 of 22 on Wikipedia XML. The deep tiers lead in density on jsonreal (level 9 runs 11% denser at the same speed, level 13 13% denser) and on the dll payload (levels 16 to 19 run 19% to 24% denser at up to 1.25x the speed), while the dll payload's fast levels emit 44% to 99% more compression than libzstd's at 1.0x to 1.2x the speed. Where a matched level is slower, it still emits the smaller frame or stays within 2% of the libzstd size. Across the synthetic regression sweep of 5 shapes, 6 levels, both APIs and both threading modes, the geometric mean ratio stays 8.7% denser than libzstd at matched levels.
 
 ![Streaming encode, 8 workers vs libzstd at 8 workers](https://raw.githubusercontent.com/lxl66566/zstdx/main/assets/encode-stream-mt.svg)
 
-With 8 workers, streaming encode is 1.3x to 4.8x faster at every tier on json and text. On the dll payload it is 1.6x to 2.2x faster at fast, opt and ultra, and 0.5x to 0.9x at the other three tiers.
+With 8 workers on real payloads, streaming encode is 1.3x to 4.5x faster at the fast through ultra tiers on jsonreal, and 2.6x to 3.6x faster at fast, opt and ultra on Wikipedia XML. On the dll mix it is 2.0x faster at fast and 1.6x to 2.1x at opt and ultra, while the fastest tier trails libzstd's low-contention headline on every payload.
 
 ![Streaming decode speedup over libzstd](https://raw.githubusercontent.com/lxl66566/zstdx/main/assets/decode-speedup.svg)
 
-Streaming decode runs at 0.95x to 1.18x libzstd's speed on compressible shapes and at 1.2x on random data. The 16-worker decoder is 1.9x faster than libzstd's single-threaded decoder on json and the dll payload, and multi-frame inputs scale to up to 3.2x the single-threaded decoder.
+Streaming decode runs at 0.89x to 1.08x libzstd's speed on the real payloads, with jsonreal ahead at every level and pull size. The 16-worker decoder is 1.5x to 2.2x faster than libzstd's single-threaded decoder, and multi-frame inputs scale to up to 3.2x the single-threaded decoder.
 
 ## CLI
 
