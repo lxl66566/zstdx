@@ -345,6 +345,12 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
     // flight from the phase-1 prefetches).
     let mut best_len = 0usize;
     let mut best_cand = usize::MAX;
+    // The beat-check probe is carried, not recomputed per candidate:
+    // `best_len` only ever jumps from 0 to a first improvement (a
+    // matched read4 at probe 0 guarantees ml >= 4) or between
+    // improvements (ml > best_len >= 4 there), so every probe update is a
+    // plain subtract and the unimproved path keeps the last value.
+    let mut probe = 0usize;
     for &cand in &cands[..n] {
         let cand = cand as usize;
         // Beat-check (the chain walk's "potentially better" read): the 4
@@ -352,7 +358,6 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
         // load. The probe stays inside the block by the same argument as
         // chain_search (still looping means best_len is short of the
         // block end).
-        let probe = best_len.saturating_sub(3);
         if !(RAMPED && ramp.blocks(pos_abs, win_base + cand as u64))
             && read4(win, cand + probe) == read4(win, idx + probe)
         {
@@ -360,6 +365,7 @@ fn row_search_cap<const ROW_LOG: u32, const CAND_CAP: usize, const RAMPED: bool>
             if ml > best_len {
                 best_len = ml;
                 best_cand = cand;
+                probe = ml - 3;
                 // Cannot be improved on within this block.
                 if pos_abs + ml as u64 >= block_end {
                     break;
@@ -634,6 +640,14 @@ impl MatchGeneratorDriver {
         // Declared before the scan macro: macro-internal identifiers
         // resolve against the definition site's locals.
         let mut end;
+        // The segment's scan bar in hoisted form: `pos < bar` is exactly
+        // `end.saturating_sub(pos) >= hash_read`. The walk's guards below
+        // spell their own `p2 + hash_read` end compares, which stay exact
+        // in the same sub-HASH_READ corner without the saturate. A
+        // sub-HASH_READ segment saturates to a 0 bar, which admits no
+        // pos (a bare `end - hash_read + 1` would wrap there and
+        // wrongly admit 0).
+        let mut bar;
 
         // The body exists in two phases (the chain loop's pattern): the
         // seeded phase carries the job-start state, which only ever winds
@@ -780,13 +794,13 @@ impl MatchGeneratorDriver {
                             break;
                         }
                         let p2 = pos + 1;
-                        if end.saturating_sub(p2) < hash_read {
+                        if p2 + hash_read > end {
                             break 'lazy;
                         }
                         pos = p2;
                         let idx2 = (p2 - win_base) as usize;
                         let hash2 = row_hash_at(win, idx2, hash_log, ROW_LOG, width);
-                        if end.saturating_sub(p2 + 1) >= hash_read {
+                        if p2 + hash_read < end {
                             let hn = row_hash_at(win, idx2 + 1, hash_log, ROW_LOG, width);
                             row_prefetch::<ROW_LOG>(tables, hn);
                         }
@@ -890,7 +904,7 @@ impl MatchGeneratorDriver {
             // either way, and the scan's top-of-loop prefetch takes over
             // from the next step.
             let next = win_base + (start + ml) as u64;
-            if end.saturating_sub(next) > hash_read {
+            if next + hash_read < end {
                 let hn = row_hash_at(win, start + ml, hash_log, ROW_LOG, width);
                 row_prefetch::<ROW_LOG>(tables, hn);
             }
@@ -928,16 +942,19 @@ impl MatchGeneratorDriver {
                 end = block_end;
                 None
             };
+            bar = if end >= hash_read {
+                end - hash_read + 1
+            } else {
+                0
+            };
             // Seeded phase: job starts only; each emit re-checks convergence
             // at the head, and the values only ever wind down. The phase
             // spans segments like blocks — the seeded state is the scan's,
             // not a segment's.
-            'seeded: while (rep_pending != 0 || seed_offset != 0)
-                && end.saturating_sub(pos) >= hash_read
-            {
+            'seeded: while (rep_pending != 0 || seed_offset != 0) && pos < bar {
                 scan_row!('seeded, true, LDM);
             }
-            'restart: while end.saturating_sub(pos) >= hash_read {
+            'restart: while pos < bar {
                 scan_row!('restart, false, LDM);
             }
             let Some(seq) = seq else {
