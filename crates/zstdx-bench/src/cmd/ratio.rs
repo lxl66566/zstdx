@@ -32,7 +32,7 @@ use zstdx::{EncoderOptions, Level, stream::read::Encoder as RuzStreamEncoder};
 
 use crate::{
     common::want,
-    corpus::{LADDER, LevelName, SHAPES, Shape, assert_roundtrip, load_raw},
+    corpus::{LADDER, LevelName, Shape, assert_roundtrip, load_raw, resolve_shapes},
 };
 
 /// Encode paths whose output sizes are compared. `Uncompressed` is not a
@@ -264,9 +264,8 @@ fn print_summary(rows: &[Row], args: &Args, t0: Instant) {
     }
     summary_group("per mode (geo-mean Δ% over cells)", &by_mode);
 
-    let by_shape: Vec<(String, Vec<f64>)> = SHAPES
+    let by_shape: Vec<(String, Vec<f64>)> = resolve_shapes(&args.shape)
         .iter()
-        .filter(|s| want(&args.shape, s))
         .map(|s| {
             (
                 s.raw_name().to_owned(),
@@ -314,10 +313,9 @@ fn print_summary(rows: &[Row], args: &Args, t0: Instant) {
 
 pub fn run(args: &Args) {
     let t0 = Instant::now();
-    let shapes: Vec<(Shape, Arc<Vec<u8>>)> = SHAPES
+    let shapes: Vec<(Shape, Arc<Vec<u8>>)> = resolve_shapes(&args.shape)
         .iter()
         .copied()
-        .filter(|s| want(&args.shape, s))
         .map(|s| (s, Arc::new(load_raw(s))))
         .collect();
     let levels: Vec<LevelName> = LADDER

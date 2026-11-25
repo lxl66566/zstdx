@@ -49,9 +49,9 @@ use zstdx::{
 use crate::{
     common::{Ab, apply_budget, black_box, measure_solo, want},
     corpus::{
-        LADDER, LevelName, LevelSel, SHAPES, Shape, assert_roundtrip, corpus_dir, gate_ruz_dec,
+        LADDER, LevelName, LevelSel, Shape, assert_roundtrip, corpus_dir, gate_ruz_dec,
         gate_ruz_enc, gate_ruz_mt_dec, gate_zstd_dec, gate_zstd_enc, load, load_raw,
-        raw_counterpart, want_number, want_tier,
+        raw_counterpart, resolve_shapes, want_number, want_tier,
     },
     pool::{DEFAULT_TIMING_WIDTH, run_cells},
 };
@@ -191,11 +191,7 @@ fn pad(name: &str) -> String {
 }
 
 fn shapes_selected(args: &Args) -> Vec<Shape> {
-    SHAPES
-        .iter()
-        .copied()
-        .filter(|s| want(&args.shape, s))
-        .collect()
+    resolve_shapes(&args.shape)
 }
 
 /// One level cell of an encode section: row tag, our level, libzstd level.
@@ -749,9 +745,16 @@ fn t4_enc_mt(ab: &Ab, args: &Args) {
 /// (e.g. `bench/big/dll100.raw`). Raw files join the ST section only. The
 /// bytes are shared between the ST cells and the serial MT section.
 fn t5_payloads(args: &Args) -> Vec<(String, Arc<Vec<u8>>)> {
-    let mut v: Vec<(String, Arc<Vec<u8>>)> = [Shape::Json, Shape::Text]
+    // the curated json/text pair, plus any explicitly selected shape so
+    // the real-world opt-ins can join the streaming section by name
+    let mut wanted: Vec<Shape> = vec![Shape::Json, Shape::Text];
+    for s in &args.shape {
+        if !wanted.contains(s) {
+            wanted.push(*s);
+        }
+    }
+    let mut v: Vec<(String, Arc<Vec<u8>>)> = wanted
         .into_iter()
-        .filter(|s| want(&args.shape, s))
         .map(|s| (s.raw_name().to_owned(), Arc::new(load_raw(s))))
         .collect();
     for path in args.file.iter().filter(|p| !is_zst_payload(p)) {

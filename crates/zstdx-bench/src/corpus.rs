@@ -21,6 +21,12 @@ pub enum Shape {
     Random,
     /// Maximally redundant.
     Zeros,
+    /// Real-world event JSON lines (`gen_real.sh`): opt-in axis.
+    #[value(name = "jsonreal")]
+    JsonReal,
+    /// Real-world English prose, enwik8 wiki XML (`gen_real.sh`): opt-in axis.
+    #[value(name = "textreal")]
+    TextReal,
 }
 
 impl Shape {
@@ -31,6 +37,8 @@ impl Shape {
             Shape::Skewed => "skewed",
             Shape::Random => "random",
             Shape::Zeros => "zeros",
+            Shape::JsonReal => "jsonreal",
+            Shape::TextReal => "textreal",
         }
     }
 }
@@ -42,6 +50,33 @@ pub const SHAPES: [Shape; 5] = [
     Shape::Random,
     Shape::Zeros,
 ];
+
+/// Every corpus shape, the recorded default sweep first, the real-world
+/// opt-ins last (`gen_real.sh`).
+pub const ALL_SHAPES: [Shape; 7] = [
+    Shape::Json,
+    Shape::Text,
+    Shape::Skewed,
+    Shape::Random,
+    Shape::Zeros,
+    Shape::JsonReal,
+    Shape::TextReal,
+];
+
+/// Shared `--shape` resolution: an empty selection keeps the recorded
+/// default sweep on `SHAPES`, an explicit selection can name any shape in
+/// `ALL_SHAPES`, so the opt-in axes join by name without moving the
+/// recorded cells.
+pub fn resolve_shapes(selected: &[Shape]) -> Vec<Shape> {
+    if selected.is_empty() {
+        return SHAPES.to_vec();
+    }
+    ALL_SHAPES
+        .iter()
+        .copied()
+        .filter(|s| selected.contains(s))
+        .collect()
+}
 
 /// Our level ladder bench-matched against libzstd levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

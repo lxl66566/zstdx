@@ -6,6 +6,7 @@ This page answers how to run each benchmark, which flags select corpus shapes an
 
 - Build and run with `cargo run --release -p zstdx-bench -- <subcommand> [flags]`. Always use `--release`, because debug builds measure nothing.
 - The corpus prerequisite is one run of `bash bench/gen_corpus.sh`. It writes 32 MiB files for five shapes: `json`, `text`, `skewed`, `random` and `zeros`. It also writes `.zst1/3/9` variants, plus `.zst19` for json, text and skewed.
+- `bash bench/gen_real.sh` is an optional second script that fetches the two real-world opt-in shapes: `jsonreal`, one pinned hour of GitHub Archive event JSON lines, and `textreal`, the first 32 MiB of the enwik8 Wikipedia XML dump. Downloads are pinned and sha256-verified, and each shape also gets `.zst1/3/9` variants. The shapes join a sweep only through an explicit `--shape jsonreal,textreal`; an empty `--shape` keeps the core five, so recorded sweeps stay comparable. The 2026-11-24 corpus-realism calibration measured on these axes lives in `docs/src/dev/bench/methodology.md`.
 - Timing subcommands share an interleaved A/B harness in `src/common.rs`. Both sides alternate round by round and the per-round ratio is the primary verdict, which is resistant to clock drift. Each side gets a time budget from `--budget-ms`, default 500 ms, or from the `BENCH_BUDGET_MS` environment variable. A side that is far faster than its counterpart stops at one sixteenth of the budget once the slow side spent the full budget, because every further round costs a full slow-side round for a handful of fast-side samples; this bounds asymmetric cells such as the deep-level random rows, where the libzstd side runs seconds per round. Cells whose warmup round pair already costs 8 times the budget run two pairs instead of the 3-round minimum, so a multi-second round pair no longer pays the full floor three times over.
 - `ZSTDX_DEC_SIMD_TIER=scalar|bmi2` is a library environment override. Unset means runtime detection, and an invalid value panics. It forces the decode SIMD tier, so running the decode subcommands `files`, `mtcheck`, `corrupt` and `prof dec` under it gates the forced tiers on any machine; `tierdiff` runs both forced tiers itself and compares them cell by cell.
 - Deterministic, instruction-count based benchmarks under valgrind live in the sibling crate [`zstdx-gungraun`](../zstdx-gungraun/Readme.md).
@@ -23,6 +24,7 @@ The reported percentage is `zstdx_ratio / zstd_ratio - 1`, so a positive value m
 ```bash
 cargo run --release -p zstdx-bench -- ratio                  # full sweep (~min, parallel)
 cargo run --release -p zstdx-bench -- ratio --shape json,text --level ultra
+cargo run --release -p zstdx-bench -- ratio --shape json,text,jsonreal,textreal   # + real-world axes
 cargo run --release -p zstdx-bench -- ratio --mode bulk-st,bulk-mt
 cargo run --release -p zstdx-bench -- ratio --no-ref         # our sizes only
 ```
