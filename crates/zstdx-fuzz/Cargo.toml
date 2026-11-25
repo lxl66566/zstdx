@@ -55,7 +55,7 @@ path = "fuzz_targets/ldm_mt_parity.rs"
 libfuzzer-sys = "0.4"
 # reference implementation for the interop targets; same binding the
 # zstdx-bench crate compares against
-zstd          = "0.13.2"
+zstd          = "0.14"
 
 [dependencies.zstdx]
 path     = "../zstdx"

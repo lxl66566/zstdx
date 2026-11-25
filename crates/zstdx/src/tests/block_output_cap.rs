@@ -203,11 +203,15 @@ fn small_window_rejects_oversized_raw_block() {
     ));
 
     // decode_all's direct-into-slice path, with far more target room than
-    // any legal block could fill: the one-shot reference
-    // (ZSTD_decompressFrame's ZSTD_copyRawBlock) bounds Raw/RLE blocks only
-    // by the destination, reserving the per-block cap for the streaming
-    // paths (ZSTD_decompressContinue's header-stage check), so the oversized
-    // block decodes here (R72 probe: pledged_w10_f400015 oneshot ACCEPT).
+    // any legal block could fill: the one-shot path keeps the Raw/RLE
+    // block lift that mirrored libzstd 1.5.7, where
+    // `ZSTD_decompressFrame`'s `ZSTD_copyRawBlock` bounds Raw/RLE blocks
+    // only by the destination and reserves the per-block cap for the
+    // streaming paths (`ZSTD_decompressContinue`'s header-stage check).
+    // libzstd 1.6.0 (zstd-sys 2.2.0) added the same cap to
+    // `ZSTD_decompressFrame`, so the oversized block now decodes only on
+    // the zstdx side (R72 probe: pledged_w10_f400015 oneshot ACCEPT), a
+    // documented divergence.
     let mut dec = FrameDecoder::new();
     let mut out = vec![0u8; 32 * 1024 * 1024];
     let written = dec

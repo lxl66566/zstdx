@@ -142,11 +142,25 @@ fn test_all_encode_artifacts() {
 /// acceptance flips between the streaming generation model and the
 /// one-shot whole-history rule, plus the dict-prefill expiry classes.
 /// The pinned per-path outcomes live in `decode_window_semantics`; this
-/// pass instead checks LIVE agreement with the reference — any frame a
-/// zstdx path accepts, the reference path must accept with equal bytes
-/// (the reverse direction is not asserted: zstdx rejecting where the
-/// reference accepts is the deliberately stricter generation model / the
-/// pinned single-pass-shortcut deviation).
+/// pass instead checks LIVE agreement with the reference, classified
+/// per frame against libzstd 1.6.0 (zstd-sys 2.2.0):
+///
+/// - the streaming decoder clamps the retained external history to the declared window.
+///   `ZSTD_checkContinuity`, once `decodedSize >= windowSize`, shrinks the ext-dict side (a
+///   wrapped-out ring generation or an attached dictionary) to `windowSize - prefixSize`. Every
+///   beyond-window offset that 1.5.7 accepted through the ring slack — the generation pair, the
+///   dict tail before the first wrap, the wrapped-ring alias class in the test below — rejects now.
+/// - the one-shot decoder keeps the whole-history rule for offsets, but `ZSTD_decompressFrame`
+///   newly rejects Raw/RLE blocks over min(window, 128 KiB); the f400015 pledge frame's 2000-byte
+///   blocks exceed w10's 1024-byte cap.
+///
+/// Any frame a zstdx path accepts must see its classified reference
+/// verdict: equal bytes where the reference accepts, the classified
+/// rejection where it rejects. The reverse direction stays unasserted
+/// (zstdx rejecting where the reference accepts is the deliberately
+/// stricter generation model / the pinned single-pass-shortcut
+/// deviation; zstdx accepting where 1.6.0 rejects is the kept 1.5.7
+/// model on the clamped classes above).
 #[test]
 fn test_window_probe_frames() {
     extern crate std;
@@ -158,6 +172,14 @@ fn test_window_probe_frames() {
         decoding::{FrameDecoder, StreamingDecoder, dictionary::Dictionary},
         io::Read,
     };
+
+    /// The reference verdict a zstdx-accepted frame must reproduce.
+    enum RefVerdict {
+        /// The reference decodes and must match zstdx's bytes.
+        Accept,
+        /// The reference rejects (the libzstd 1.6.0 classes above).
+        Reject,
+    }
 
     fn stream(frame: &[u8]) -> Option<Vec<u8>> {
         let mut dec = StreamingDecoder::new(frame).ok()?;
@@ -204,73 +226,171 @@ fn test_window_probe_frames() {
             .map(|n| out[..n].to_vec())
     }
 
-    let plain: Vec<(&str, Vec<u8>)> = vec![
-        ("ctrl_w10_o900", frame(10, 180, 1000, 900, None)),
-        ("fa_w10_o100000", frame(10, 180, 1000, 100000, None)),
-        ("sw_w10_o3100", frame(10, 180, 1000, 3100, None)),
-        ("ctrl_w16_o50000", frame(16, 3, 60000, 50000, None)),
-        ("fa_w16_o100000", frame(16, 3, 60000, 100000, None)),
-        ("sw6_w16_o200000", frame(16, 6, 60000, 200000, None)),
-        ("sw6_w16_o360000", frame(16, 6, 60000, 360000, None)),
+    let plain: Vec<(&str, Vec<u8>, RefVerdict, RefVerdict)> = vec![
+        (
+            "ctrl_w10_o900",
+            frame(10, 180, 1000, 900, None),
+            RefVerdict::Accept,
+            RefVerdict::Accept,
+        ),
+        (
+            "fa_w10_o100000",
+            frame(10, 180, 1000, 100000, None),
+            RefVerdict::Reject,
+            RefVerdict::Accept,
+        ),
+        (
+            "sw_w10_o3100",
+            frame(10, 180, 1000, 3100, None),
+            RefVerdict::Reject,
+            RefVerdict::Accept,
+        ),
+        (
+            "ctrl_w16_o50000",
+            frame(16, 3, 60000, 50000, None),
+            RefVerdict::Accept,
+            RefVerdict::Accept,
+        ),
+        (
+            "fa_w16_o100000",
+            frame(16, 3, 60000, 100000, None),
+            RefVerdict::Reject,
+            RefVerdict::Accept,
+        ),
+        (
+            "sw6_w16_o200000",
+            frame(16, 6, 60000, 200000, None),
+            RefVerdict::Reject,
+            RefVerdict::Accept,
+        ),
+        (
+            "sw6_w16_o360000",
+            frame(16, 6, 60000, 360000, None),
+            RefVerdict::Reject,
+            RefVerdict::Accept,
+        ),
         (
             "pledged_w10_f400015_o7000",
             frame(10, 200, 2000, 7000, Some(400015)),
+            RefVerdict::Reject,
+            RefVerdict::Reject,
         ),
         (
             "pledged_w10_f3015_o2500",
             frame(10, 3, 1000, 2500, Some(3015)),
+            RefVerdict::Accept,
+            RefVerdict::Accept,
         ),
         (
             "pledged_w10_f60015_o50000",
             frame(10, 60, 1000, 50000, Some(600015)),
+            RefVerdict::Reject,
+            RefVerdict::Accept,
         ),
     ];
-    for (name, f) in &plain {
+    for (name, f, ref_stream, ref_oneshot) in &plain {
         if let Some(out) = stream(f) {
-            let mut reference = Vec::new();
-            zstd::stream::copy_decode(&f[..], &mut reference)
-                .unwrap_or_else(|e| panic!("{name}: reference stream rejects: {e}"));
-            assert_eq!(reference, out, "{name}: reference stream bytes differ");
+            match ref_stream {
+                RefVerdict::Accept => {
+                    let mut reference = Vec::new();
+                    zstd::stream::copy_decode(&f[..], &mut reference)
+                        .unwrap_or_else(|e| panic!("{name}: reference stream rejects: {e}"));
+                    assert_eq!(reference, out, "{name}: reference stream bytes differ");
+                },
+                RefVerdict::Reject => assert!(
+                    zstd::stream::copy_decode(&f[..], &mut Vec::new()).is_err(),
+                    "{name}: reference stream must reject (libzstd 1.6.0 window clamp)"
+                ),
+            }
         }
         if let Some(out) = oneshot(f) {
-            let mut reference = vec![0u8; 1 << 20];
-            let n = zstd::bulk::Decompressor::new()
-                .unwrap()
-                .decompress_to_buffer(f, &mut reference)
-                .unwrap_or_else(|e| panic!("{name}: reference oneshot rejects: {e}"));
-            assert_eq!(
-                &reference[..n],
-                &out[..],
-                "{name}: reference oneshot bytes differ"
-            );
+            match ref_oneshot {
+                RefVerdict::Accept => {
+                    let mut reference = vec![0u8; 1 << 20];
+                    let n = zstd::bulk::Decompressor::new()
+                        .unwrap()
+                        .decompress_to_buffer(f, &mut reference)
+                        .unwrap_or_else(|e| panic!("{name}: reference oneshot rejects: {e}"));
+                    assert_eq!(
+                        &reference[..n],
+                        &out[..],
+                        "{name}: reference oneshot bytes differ"
+                    );
+                },
+                RefVerdict::Reject => assert!(
+                    zstd::bulk::Decompressor::new()
+                        .unwrap()
+                        .decompress_to_buffer(f, &mut vec![0u8; 1 << 20])
+                        .is_err(),
+                    "{name}: reference oneshot must reject (block over min(window, 128 KiB))"
+                ),
+            }
         }
     }
 
     let dict = dict4096();
-    let pairs: Vec<(&str, Vec<u8>)> = vec![
-        ("dict_pre2000_o4000", frame(10, 2, 1000, 4000, None)),
-        ("dict_pre2000_o7000", frame(10, 2, 1000, 7000, None)),
-        ("dict_pre4000_o4500", frame(10, 4, 1000, 4500, None)),
+    let pairs: Vec<(&str, Vec<u8>, RefVerdict, RefVerdict)> = vec![
+        (
+            "dict_pre2000_o4000",
+            frame(10, 2, 1000, 4000, None),
+            RefVerdict::Reject,
+            RefVerdict::Accept,
+        ),
+        (
+            "dict_pre2000_o7000",
+            frame(10, 2, 1000, 7000, None),
+            RefVerdict::Reject,
+            RefVerdict::Reject,
+        ),
+        (
+            "dict_pre4000_o4500",
+            frame(10, 4, 1000, 4500, None),
+            RefVerdict::Reject,
+            RefVerdict::Accept,
+        ),
     ];
-    for (name, f) in &pairs {
+    for (name, f, ref_stream, ref_oneshot) in &pairs {
         if let Some(out) = stream_dict(f, &dict) {
-            let mut reference = Vec::new();
-            let mut zdec = zstd::stream::Decoder::with_dictionary(&f[..], &dict).unwrap();
-            StdRead::read_to_end(&mut zdec, &mut reference)
-                .unwrap_or_else(|e| panic!("{name}: reference stream-dict rejects: {e}"));
-            assert_eq!(reference, out, "{name}: reference stream-dict bytes differ");
+            match ref_stream {
+                RefVerdict::Accept => {
+                    let mut reference = Vec::new();
+                    let mut zdec = zstd::stream::Decoder::with_dictionary(&f[..], &dict).unwrap();
+                    StdRead::read_to_end(&mut zdec, &mut reference)
+                        .unwrap_or_else(|e| panic!("{name}: reference stream-dict rejects: {e}"));
+                    assert_eq!(reference, out, "{name}: reference stream-dict bytes differ");
+                },
+                RefVerdict::Reject => {
+                    let mut zdec = zstd::stream::Decoder::with_dictionary(&f[..], &dict).unwrap();
+                    let mut reference = Vec::new();
+                    assert!(
+                        StdRead::read_to_end(&mut zdec, &mut reference).is_err(),
+                        "{name}: reference stream-dict must reject (libzstd 1.6.0 window clamp)"
+                    );
+                },
+            }
         }
         if let Some(out) = oneshot_dict(f, &dict) {
-            let mut reference = vec![0u8; 1 << 20];
-            let n = zstd::bulk::Decompressor::with_dictionary(&dict)
-                .unwrap()
-                .decompress_to_buffer(f, &mut reference)
-                .unwrap_or_else(|e| panic!("{name}: reference oneshot-dict rejects: {e}"));
-            assert_eq!(
-                &reference[..n],
-                &out[..],
-                "{name}: reference oneshot-dict bytes differ"
-            );
+            match ref_oneshot {
+                RefVerdict::Accept => {
+                    let mut reference = vec![0u8; 1 << 20];
+                    let n = zstd::bulk::Decompressor::with_dictionary(&dict)
+                        .unwrap()
+                        .decompress_to_buffer(f, &mut reference)
+                        .unwrap_or_else(|e| panic!("{name}: reference oneshot-dict rejects: {e}"));
+                    assert_eq!(
+                        &reference[..n],
+                        &out[..],
+                        "{name}: reference oneshot-dict bytes differ"
+                    );
+                },
+                RefVerdict::Reject => assert!(
+                    zstd::bulk::Decompressor::with_dictionary(&dict)
+                        .unwrap()
+                        .decompress_to_buffer(f, &mut vec![0u8; 1 << 20])
+                        .is_err(),
+                    "{name}: reference oneshot-dict must reject"
+                ),
+            }
         }
     }
 }
@@ -279,12 +399,17 @@ fn test_window_probe_frames() {
 /// ring wraps after 2490 RLE bytes, ending in a sequence whose offset
 /// (2497) stays inside the whole history but resolves through the
 /// wrapped ring into the post-wrap prefix — the two zstdx paths decode
-/// it to DIFFERENT bytes, each matching its own libzstd counterpart
-/// exactly (streaming vs `ZSTD_decompressStream`, one-shot vs
-/// `ZSTD_decompress`). The pre-R73 decode fuzz target asserted
-/// `streamed == flat` and crashed here; the asymmetry is by design
-/// (R72's generation model). Reference agreement on both paths plus the
-/// divergence pin itself.
+/// it to DIFFERENT bytes (R72's generation model; the pre-R73 decode
+/// fuzz target asserted `streamed == flat` and crashed here). Under
+/// libzstd 1.5.7 both paths matched their reference counterparts byte
+/// for byte. libzstd 1.6.0 (zstd-sys 2.2.0) still accepts the frame
+/// one-shot — `ZSTD_decompressFrame` keeps whole-history offsets — and
+/// that byte agreement stays pinned, while its streaming decoder now
+/// rejects the frame: `ZSTD_checkContinuity` clamps the wrapped-out
+/// generation to the declared window once `decodedSize >= windowSize`,
+/// and 2497 exceeds the w10 window. zstdx keeps the 1.5.7 model and
+/// still streams the frame, so the streaming-side reference agreement is
+/// replaced by pinning the 1.6.0 rejection.
 #[test]
 fn test_wrapped_ring_alias_frame() {
     use crate::{
@@ -336,9 +461,10 @@ fn test_wrapped_ring_alias_frame() {
     );
 
     let mut zstream = Vec::new();
-    zstd::stream::copy_decode(&f[..], &mut zstream)
-        .expect("reference streaming rejects the alias frame");
-    assert_eq!(zstream, streamed, "reference streaming bytes differ");
+    assert!(
+        zstd::stream::copy_decode(&f[..], &mut zstream).is_err(),
+        "libzstd 1.6.0 streaming must reject the beyond-window alias frame"
+    );
 
     let mut rbuf = vec![0u8; 1 << 20];
     let rn = zstd::bulk::Decompressor::new()

@@ -16,16 +16,25 @@
 //! path separately). The checks are one-directional: zstdx rejecting
 //! where the reference accepts is not an error (the deliberately
 //! stricter generation model covers that direction); anything a zstdx
-//! path accepts, its reference counterpart must accept with equal bytes
-//! — except the streamed byte-compare, which only runs when the
+//! path accepts must decode equal bytes through its reference
+//! counterpart, with two exceptions since libzstd 1.6.0 (zstd-sys
+//! 2.2.0):
+//! - `ZSTD_checkContinuity` clamps the streaming decoder's retained history to the declared window,
+//!   so its streaming path rejects beyond-window offsets that zstdx streaming still accepts under
+//!   the kept 1.5.7 generation model. The flat check has already proven the frame decodes
+//!   whole-history, so a reference streaming rejection ends the oracle there.
+//! - `ZSTD_decompressFrame` newly rejects Raw and RLE blocks over `min(window, 128 KiB)`, a cap
+//!   zstdx's flat path keeps lifting (the 1.5.7 one-shot asymmetry), so the flat check proves the
+//!   stream really holds an over-cap block (`block_cap_escape`) before taking the rejection; any
+//!   other reference one-shot rejection stays a divergence.
+//! The streamed byte-compare only runs when the
 //! reference's own streaming and one-shot outputs agree: on a
 //! window-invalid aliased frame the accepted bytes are caller-layout
 //! defined (libzstd's ring resolves the aliased offset against whatever
 //! its own buffer geometry retains; the zstd crate's layout yielded
 //! stale-ring bytes the CLI's does not — R73 artifact
 //! crash-e9590bef, adjudicated not a zstdx defect), so no
-//! cross-implementation byte oracle exists there. Accept/reject
-//! agreement is still checked unconditionally.
+//! cross-implementation byte oracle exists there.
 //!
 //! Decoded size is bounded: a 300 KB crafted input of RLE/match blocks
 //! can declare gigabytes of output, and neither path's checks matter past
@@ -33,6 +42,9 @@
 //! the check instead.
 
 use std::io::Read;
+
+#[path = "../block_cap_escape.rs"]
+mod block_cap_escape;
 
 use libfuzzer_sys::fuzz_target;
 use zstdx::decoding::{FrameDecoder, StreamingDecoder, errors::FrameDecoderError};
@@ -88,15 +100,29 @@ fn oracle(data: &[u8]) {
 
     // Flat vs the reference one-shot (ZSTD_decompress decodes every
     // concatenated frame whole-history, like decode_all). A reference
-    // output larger than the buffer is a length divergence and fails the
-    // expect; anything at most flat's size must match byte for byte.
-    // Runs before the streamed compare: agreement with the reference
-    // streaming output is the layout-independence adjudicator below.
+    // output larger than the buffer is a length divergence, which walks
+    // the escape below and reports as a divergence, since no over-cap
+    // block will be found; anything at most flat's size must match byte
+    // for byte. Runs before the streamed compare: agreement with the
+    // reference streaming output is the layout-independence adjudicator
+    // below.
     let mut rbuf = vec![0u8; flat.capacity().max(1 << 16)];
-    let n = zstd::bulk::Decompressor::new()
+    let n = match zstd::bulk::Decompressor::new()
         .expect("reference decoder init failed")
         .decompress_to_buffer(data, &mut rbuf)
-        .expect("reference oneshot rejects a frame zstdx flat accepted");
+    {
+        Ok(n) => n,
+        Err(_) => {
+            // Only the 1.6.0 Raw/RLE block cap may reject here (module
+            // doc); the walker proves the over-cap block before the
+            // oracle accepts the rejection.
+            assert!(
+                block_cap_escape::oversized_block_stream(data),
+                "reference oneshot rejects a frame zstdx flat accepted"
+            );
+            return;
+        },
+    };
     assert_eq!(
         &rbuf[..n],
         &flat[..],
@@ -107,8 +133,12 @@ fn oracle(data: &[u8]) {
         // Streaming vs the reference streaming decoder (multi-frame
         // inputs included: both sides decode concatenated frames).
         let mut zstream = Vec::new();
-        zstd::stream::copy_decode(std::io::Cursor::new(data), &mut zstream)
-            .expect("reference stream rejects a frame zstdx streaming accepted");
+        // A rejection is the libzstd 1.6.0 window clamp (module doc): the
+        // flat check above proved the frame decodes whole-history, so the
+        // oracle ends here instead of failing.
+        if zstd::stream::copy_decode(std::io::Cursor::new(data), &mut zstream).is_err() {
+            return;
+        }
         // Byte-equality only on layout-independent frames (module doc).
         if zstream.as_slice() == &rbuf[..n] {
             assert_eq!(

@@ -12,7 +12,11 @@
 //! (streaming) and any one-shot decoder legitimately disagree
 //! (window-violating offsets, R65 parity.md finding 7) is adjudicated by
 //! libzstd's own one-shot (`ZSTD_decompress` via the zstd crate) and
-//! reported as an asymmetry instead of failing the gate.
+//! reported as an asymmetry instead of failing the gate. The same
+//! adjudicator classifies the Raw/RLE block-cap class: libzstd 1.6.0
+//! (zstd-sys 2.2.0) added the `min(window, 128 KiB)` regenerated-size cap
+//! to the one-shot path, where zstdx's flat path keeps the 1.5.7 lift,
+//! so a mutant inflating such a block rejects on the reference side only.
 
 use std::{
     collections::BTreeMap,
@@ -25,7 +29,10 @@ use std::{
 use rayon::prelude::*;
 use zstdx::{
     DecoderOptions, EncoderOptions, Level, bulk,
-    decoding::errors::FrameDecoderError,
+    decoding::{
+        BlockDecodingStrategy, FrameDecoder,
+        errors::{DecodeBlockContentError, FrameDecoderError, ReadFrameHeaderError},
+    },
     parity::{self, CraftedName},
 };
 
@@ -547,6 +554,12 @@ enum Kind {
     /// zstdx matches libzstd's one-shot and only the CLI's streaming
     /// verdict differs: the documented API-pair asymmetry. Informational.
     OneshotAsymmetry,
+    /// zstdx's flat path accepts a Raw/RLE block whose regenerated-size
+    /// claim exceeds `min(window, 128 KiB)`, a cap libzstd 1.6.0 added to
+    /// its one-shot path (1.5.7 bounded Raw/RLE by the destination only).
+    /// The documented permissiveness class, like every streaming decoder's
+    /// verdict. Informational.
+    BlockCap,
 }
 
 struct Divergence {
@@ -558,6 +571,44 @@ struct Divergence {
     zstdx: Verdict,
     cli: Verdict,
     case_bytes: Vec<u8>,
+}
+
+/// Whether the stream holds a Raw/RLE block whose regenerated-size claim
+/// exceeds the per-block cap of `min(window, 128 KiB)`. Walks the
+/// streaming block stage, which enforces the cap at the header (the flat
+/// path lifts it, per `zstdx::tests::block_output_cap`). `false` on any
+/// parse failure: the caller treats the case as a hard divergence.
+fn oversized_block_claim(mut data: &[u8]) -> bool {
+    let mut dec = FrameDecoder::new();
+    loop {
+        match dec.reset(&mut data) {
+            // Skippable frames carry no blocks; mirror decode_all's skip
+            // (the 8 header bytes are already consumed through the read).
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                length,
+                ..
+            })) => {
+                let Some(rest) = data.get(u64::from(length) as usize..) else {
+                    return false;
+                };
+                data = rest;
+                continue;
+            },
+            Err(_) => return false,
+            Ok(()) => {},
+        }
+        match dec.decode_blocks(&mut data, BlockDecodingStrategy::All) {
+            Err(FrameDecoderError::FailedToReadBlockBody(
+                DecodeBlockContentError::BlockOutputTooLarge { .. },
+            )) => return true,
+            Err(_) => return false,
+            Ok(_) => {
+                if data.is_empty() {
+                    return false;
+                }
+            },
+        }
+    }
 }
 
 /// Compare a zstdx verdict against the CLI verdict. `None` = agree.
@@ -582,7 +633,8 @@ fn mismatch(zstdx: &Verdict, cli: &Verdict) -> Option<Mismatch> {
 }
 
 /// Classify a mismatch: hard unless zstdx's verdict (bytes included)
-/// matches libzstd's one-shot and only the CLI differs.
+/// matches libzstd's one-shot and only the CLI differs, or the mismatch
+/// is the documented Raw/RLE block-cap permissiveness.
 fn classify(zstdx: &Verdict, cli: &Verdict, bytes: &[u8]) -> Kind {
     if matches!(zstdx, Verdict::Reject(e) if e.starts_with("PANIC:")) {
         return Kind::Hard;
@@ -595,12 +647,19 @@ fn classify(zstdx: &Verdict, cli: &Verdict, bytes: &[u8]) -> Kind {
         (Verdict::Reject(_), Verdict::Reject(_)) => true,
         _ => false,
     };
-    let reference_differs_from_cli = mismatch(&reference, cli).is_some();
-    if matches_reference && reference_differs_from_cli {
-        Kind::OneshotAsymmetry
-    } else {
-        Kind::Hard
+    if matches_reference {
+        return if mismatch(&reference, cli).is_some() {
+            Kind::OneshotAsymmetry
+        } else {
+            Kind::Hard
+        };
     }
+    // zstdx accepts what the one-shot reference rejects: the block-cap
+    // class only when the stream really holds the over-cap claim.
+    if matches!(zstdx, Verdict::Accept(_)) && oversized_block_claim(bytes) {
+        return Kind::BlockCap;
+    }
+    Kind::Hard
 }
 
 fn decode_options(threads: u32, dict: Option<&[u8]>) -> DecoderOptions {
@@ -786,6 +845,10 @@ pub fn run(args: &Args) {
         .iter()
         .filter(|d| d.kind == Kind::OneshotAsymmetry)
         .count();
+    let blockcap = divergences
+        .iter()
+        .filter(|d| d.kind == Kind::BlockCap)
+        .count();
 
     println!(
         "parity{sampled_note}: {} cases ({} real seeds, {} B frames + {} crafted)",
@@ -801,16 +864,20 @@ pub fn run(args: &Args) {
     );
     let hard_shown = divergences.iter().filter(|d| d.kind == Kind::Hard).count();
     let asym_shown = 4;
+    let blockcap_shown = 4;
     let mut hard_left = hard_shown;
     let mut asym_left = asym_shown;
+    let mut blockcap_left = blockcap_shown;
     for d in &divergences {
         let label = match d.kind {
             Kind::Hard => "DIVERGENCE",
             Kind::OneshotAsymmetry => "oneshot-asymmetry",
+            Kind::BlockCap => "block-cap permissiveness",
         };
         let left = match d.kind {
             Kind::Hard => &mut hard_left,
             Kind::OneshotAsymmetry => &mut asym_left,
+            Kind::BlockCap => &mut blockcap_left,
         };
         if *left == 0 {
             continue;
@@ -866,7 +933,13 @@ pub fn run(args: &Args) {
     if asym_shown < asym {
         println!("... and {} more oneshot-asymmetry", asym - asym_shown);
     }
-    println!("divergences: {hard} hard, {asym} oneshot-asymmetry");
+    if blockcap_shown < blockcap {
+        println!(
+            "... and {} more block-cap permissiveness",
+            blockcap - blockcap_shown
+        );
+    }
+    println!("divergences: {hard} hard, {asym} oneshot-asymmetry, {blockcap} block-cap");
     if hard > 0 {
         println!("PARITY FAILED");
         std::process::exit(1);

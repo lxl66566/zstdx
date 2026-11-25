@@ -131,8 +131,8 @@ fn records(rng: &mut Rng, len: usize) -> Vec<u8> {
         let payload_len = ((state >> 25) % 24) as usize;
         out.extend_from_slice(
             format!(
-                "{{\"id\":{id},\"user\":\"user_{user}\",\"event\":\"{event}\",\"ts\":{},\"\
-                 payload\":\"",
+                "{{\"id\":{id},\"user\":\"user_{user}\",\"event\":\"{event}\",\"ts\":{},\"payload\\
+                 ":\"",
                 1700000000 + id
             )
             .as_bytes(),
@@ -286,8 +286,9 @@ fn multiframe_seed(data: &[u8]) {
         // A noise frame clears the 512-KiB floor at raw size, engaging the
         // lane path for otherwise-sub-floor streams.
         let pad = 600 * 1024 - stream.len() + 4096;
-        let frame = bulk::compress_with(&noise(&mut rng, pad), &EncoderOptions::new(Level::Fastest))
-            .unwrap();
+        let frame =
+            bulk::compress_with(&noise(&mut rng, pad), &EncoderOptions::new(Level::Fastest))
+                .unwrap();
         stream.extend_from_slice(&frame);
     }
     let before = frame_lane_engagements();

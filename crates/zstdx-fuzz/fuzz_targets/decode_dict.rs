@@ -13,6 +13,13 @@
 //!   vs the reference one-shot. The two zstdx paths are NOT compared with each other: they differ
 //!   by design once the ring wraps (R72); see the `decode` target. Checks are one-directional
 //!   (zstdx rejecting where the reference accepts is the stricter generation model), and the
+//!   streamed check carries the libzstd 1.6.0 exception from the `decode` target: since zstd-sys
+//!   2.2.0 `ZSTD_checkContinuity` clamps the streaming decoder's retained history to the declared
+//!   window, so a frame whose offset reaches past the window into the dictionary rejects on the
+//!   reference streaming side while zstdx streaming still accepts it (the kept 1.5.7 model); the
+//!   flat check has already proven the frame whole-history, so the oracle ends there. The reference
+//!   one-shot check stays unconditional: the 1.6.0 Raw/RLE block cap cannot reach it, because dict
+//!   frames decode through the ring executor which enforces the cap on the zstdx side first. The
 //!   streamed byte-compare only runs when the reference's own streaming and one-shot outputs agree
 //!   (layout-independent frames; on window-invalid aliased frames the accepted bytes are
 //!   caller-layout defined — see the `decode` target's module doc). Oversized outputs skip the
@@ -90,6 +97,10 @@ fn oracle(dict_raw: &[u8], frame: &[u8]) {
     // output larger than the buffer is a length divergence and fails the
     // expect. Runs before the streamed compare: agreement with the
     // reference streaming output is the layout-independence adjudicator.
+    // The libzstd 1.6.0 Raw/RLE block cap cannot reach this check: dict
+    // frames decode through the ring executor, which enforces the cap at
+    // the header stage, so an over-cap block rejects on the zstdx side
+    // first and the oracle returns above.
     let mut rbuf = vec![0u8; flat.capacity().max(1 << 16)];
     let n = zstd::bulk::Decompressor::with_dictionary(dict_raw)
         .expect("reference decoder init failed on a parsed dictionary")
@@ -106,8 +117,12 @@ fn oracle(dict_raw: &[u8], frame: &[u8]) {
         let mut zdec =
             zstd::stream::Decoder::with_dictionary(std::io::Cursor::new(frame), dict_raw)
                 .expect("reference decoder init failed on a parsed dictionary");
-        zdec.read_to_end(&mut zstream)
-            .expect("reference rejects a dict frame zstdx streaming accepted");
+        // A rejection is the libzstd 1.6.0 window clamp (module doc): the
+        // flat check above proved the frame decodes whole-history, so the
+        // oracle ends here instead of failing.
+        if zdec.read_to_end(&mut zstream).is_err() {
+            return;
+        }
         // Byte-equality only on layout-independent frames (module doc).
         if zstream.as_slice() == &rbuf[..n] {
             assert_eq!(
@@ -180,7 +195,9 @@ fn dict_edge_seed(data: &[u8]) {
     edge_header(&mut frame, 10);
     match byte(0) % 3 {
         // 2000 produced: a 4000-byte offset reaches 2000 bytes into the
-        // dict tail — accepted everywhere with identical bytes.
+        // dict tail. The window is 1 KiB, so libzstd 1.6.0's streaming
+        // decoder drops the dict once the output covers the window and
+        // rejects; flat accepts everywhere and keeps the byte check.
         0 => {
             edge_rle(&mut frame, false, 1000, 0x5a);
             edge_rle(&mut frame, false, 1000, 0x5a);

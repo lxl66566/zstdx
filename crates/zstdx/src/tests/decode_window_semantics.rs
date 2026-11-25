@@ -1,14 +1,25 @@
 //! Pinned window-semantics outcomes for the decode paths, generated from
 //! the reference-probe table recorded in the R72 decode-side fix: crafted
-//! frames exercising out-of-window offsets against libzstd's generation
-//! model (`ZSTD_decodingBufferSize_internal` cap, per-sequence
-//! `offset > oLitEnd - virtualStart` corruption rule, dict prefill and its
-//! expiry at the first wrap).
+//! frames exercising out-of-window offsets against libzstd 1.5.7's
+//! generation model (`ZSTD_decodingBufferSize_internal` cap, per-sequence
+//! `offset > oLitEnd - virtualStart` corruption rule, dict prefill and
+//! its expiry at the first wrap). zstdx implements this model and these
+//! pins hold regardless of the reference's own moves.
 //!
-//! One-shot and streaming differ BY DESIGN — the reference accepts
-//! out-of-window offsets in one-shot mode (the whole output is history,
-//! `ZSTD_decompress`) and rejects them in buffered streaming once the
-//! ring wraps. Each path is asserted against the probe table, never
+//! libzstd 1.6.0 (zstd-sys 2.2.0) tightened its streaming decoder:
+//! `ZSTD_checkContinuity`, once `decodedSize >= windowSize`, clamps the
+//! retained ext-dict side — a wrapped-out ring generation or an attached
+//! dictionary — to `windowSize - prefixSize`, so its streaming decoder
+//! rejects every beyond-window offset that the ring slack still allowed
+//! under 1.5.7. Its one-shot path keeps whole-history offsets but newly
+//! rejects Raw/RLE blocks over min(window, 128 KiB). zstdx keeps the 1.5.7
+//! model on all of these classes, a documented divergence; the live
+//! reference agreement for the classes lives in `fuzz_regressions`.
+//!
+//! One-shot and streaming differ BY DESIGN — out-of-window offsets in
+//! whole history accept in one-shot mode (the whole output is history,
+//! `ZSTD_decompress`) and reject in buffered streaming once the ring
+//! wraps. Each path is asserted against the probe table, never
 //! against the other.
 #![cfg(test)]
 
@@ -290,8 +301,9 @@ fn ring_dict_reach_without_drains() {
     );
 
     // Once bytes were drained the virtual middle is gone: offsets past the
-    // retained window are corruption (libzstd would have wrapped and
-    // dropped the dict as well).
+    // retained window are corruption (libzstd 1.6.0 drops the dictionary
+    // even earlier, once the produced output covers the window; 1.5.7
+    // dropped it at the first wrap).
     let mut buf = DecodeBuffer::new(1024);
     produce(&mut buf);
     assert!(buf.drain_to_window_size().is_some());
