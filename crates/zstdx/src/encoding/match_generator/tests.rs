@@ -519,6 +519,221 @@ fn ldm_dll_roundtrip() {
     }
 }
 
+/// The btlazy domain verdict's class scan separates the head classes:
+/// a narrow sampled alphabet takes Near (the alphabet bar first, so a
+/// twin-dense narrow head never reaches the dense scan), a wide head
+/// with long-prefix twins at the dense bar takes Dense, and a wide
+/// sparse head keeps Far — including one whose repeats stay under the
+/// dense scan's common-length bar (the jsonreal class: short key-name
+/// repeats must not read dense).
+#[test]
+fn bt_domain_class_separates_head_classes() {
+    use super::bt_domain_class;
+
+    let narrow = (0..8 * 1024)
+        .map(|i| b'a' + (i % 16) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(bt_domain_class(&narrow), BtDomain::Near);
+
+    // Wide and sparse: xorshift bytes carry no long twins.
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    let wide_sparse = (0..128 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bt_domain_class(&wide_sparse), BtDomain::Far);
+
+    // The same wide base with planted 1 KiB twins on the sample grid:
+    // the concatenated-binary head class, dense by construction.
+    let mut dense = wide_sparse.clone();
+    for k in 0..6u64 {
+        let at = (16 * 1024 + k * 8 * 1024) as usize;
+        let twin = wide_sparse[at..at + 1024].to_vec();
+        let to = at + 4 * 1024 + (k as usize) * 8 * 1024;
+        dense[to..to + 1024].copy_from_slice(&twin);
+    }
+    assert_eq!(bt_domain_class(&dense), BtDomain::Dense);
+
+    // Short repeats only (32-byte twins at the same density): the
+    // structured-text class keeps Far.
+    let mut short = wide_sparse.clone();
+    for k in 0..6u64 {
+        let at = (16 * 1024 + k * 8 * 1024) as usize;
+        let twin = wide_sparse[at..at + 32].to_vec();
+        let to = at + 4 * 1024 + (k as usize) * 8 * 1024;
+        short[to..to + 32].copy_from_slice(&twin);
+    }
+    assert_eq!(bt_domain_class(&short), BtDomain::Far);
+}
+
+/// The domain class's geometry substitution, pinned at the ladder row:
+/// Far keeps the wide ring and reach, Dense re-keys the row to the
+/// stock domain (the pre-domain-verdict geometry), Near shrinks to the
+/// probe's reach — and the strip mapping keeps the near class on the
+/// default row's strip (the strip carries the LDM's within-job history,
+/// so a near frame keeps its pinned MT bytes), while rows outside the
+/// btlazy band ignore the class entirely.
+#[test]
+fn bt_row_domain_geometry_pins_the_ring() {
+    use super::params::{LevelParams, Strategy, bt_domain_near};
+    use crate::encoding::reach_probe::SHRINK_REACH;
+
+    let shape = crate::InputShape {
+        len: None,
+        window_log: None,
+    };
+    let level = crate::Level::from_zstd(13);
+    let row = |domain: BtDomain| {
+        params_for_row(
+            level,
+            shape,
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+            domain,
+        )
+    };
+    let knobs = |p: &LevelParams, which: &str| match p.strategy {
+        Strategy::BtLazy(k) | Strategy::Opt(k) => k,
+        _ => panic!("l{which} must stay a tree row"),
+    };
+    assert_eq!(knobs(&row(BtDomain::Far), "far").bt_log, 24);
+    assert_eq!(row(BtDomain::Far).chain_reach, Some(1 << 24));
+    assert_eq!(knobs(&row(BtDomain::Dense), "dense").bt_log, 22);
+    assert_eq!(row(BtDomain::Dense).chain_reach, Some(1 << 22));
+    assert_eq!(
+        knobs(&row(BtDomain::Near), "near").bt_log,
+        SHRINK_REACH.trailing_zeros()
+    );
+    assert_eq!(row(BtDomain::Near).chain_reach, Some(SHRINK_REACH));
+    // The strip keeps the default row's span on a near frame, and the
+    // dense class re-keys it to the stock domain.
+    #[cfg(feature = "std")]
+    {
+        assert_eq!(
+            MatchGeneratorDriver::strip_for_choice(level, shape, ReachChoice::Keep, BtDomain::Near,),
+            MatchGeneratorDriver::strip_for_choice(level, shape, ReachChoice::Keep, BtDomain::Far),
+        );
+        assert_eq!(
+            MatchGeneratorDriver::strip_for_choice(
+                level,
+                shape,
+                ReachChoice::Keep,
+                BtDomain::Dense,
+            ),
+            1 << 22,
+        );
+    }
+    // The opt row shares the ring knobs without being a domain subject.
+    let opt = params_for_row(
+        crate::Level::from_zstd(16),
+        shape,
+        SmallSrcRow::Btlazy,
+        RowAttempts::Stock,
+        BalancedStore::Chain,
+        BtDomain::Dense,
+    );
+    assert_eq!(knobs(&opt, "l16").bt_log, 22, "l16 keeps its own ring");
+    // The near bar stays the sampled-alphabet bar over the verdict's own
+    // sample span, whatever longer head the caller holds.
+    let mut long_narrow = Vec::new();
+    long_narrow.extend((0..128 * 1024).map(|i| b'a' + i as u8 % 16));
+    assert!(bt_domain_near(&long_narrow));
+}
+
+/// The mt job's domain pin (`set_bt_domain`) holds the frame's class
+/// against the strip-keyed resolution the job's own first matching
+/// entry would run: a job whose strip tail samples narrow content
+/// must not shrink the domain, because the frame head already decided
+/// the class. The far-class control (a plain reset over the same
+/// strip-first window) demonstrates what a strip-keyed flip costs —
+/// the 6 MiB twin lives inside the Far domain and outside the near
+/// domain, and the near flip disarms LDM with it (a shrunk frame
+/// abandons the far domain entirely).
+#[test]
+fn mt_job_bt_domain_pin_spares_the_far_class() {
+    let _mem = heavy_mem(HeavyMem::Mid);
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // The job-shaped window: a narrow 8 KiB strip the first matching
+    // entry would sample, then a wide body carrying a 6 MiB twin.
+    let mut data = Vec::with_capacity(7 * 1024 * 1024);
+    data.extend((0..8 * 1024).map(|i| b'a' + (i % 16) as u8));
+    let body = data.len();
+    let twin_at = data.len();
+    data.extend((0..UNIT).map(|_| (rand() >> 32) as u8));
+    data.extend((0..6 * 1024 * 1024 - UNIT).map(|_| (rand() >> 32) as u8));
+    let twin = data[twin_at..twin_at + UNIT].to_vec();
+    data.extend_from_slice(&twin);
+    let end = data.len() as u64;
+
+    let parse = |pinned: Option<BtDomain>| -> Vec<usize> {
+        let mut driver = MatchGeneratorDriver::new(0);
+        driver.reset(crate::Level::from_zstd(13));
+        if let Some(domain) = pinned {
+            driver.set_bt_domain(domain, crate::Level::from_zstd(13));
+        }
+        let mut offsets = Vec::new();
+        let mut reconstructed = Vec::new();
+        let mut rep = [1u32, 4, 8];
+        let mut cursor = body as u64;
+        while cursor < end {
+            let block_end = (cursor + 128 * 1024).min(end);
+            driver.adopt_window(&data[..block_end as usize], 0);
+            driver.set_block(cursor, block_end);
+            driver.start_matching(|seq| match seq {
+                Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+                Sequence::Triple {
+                    literals,
+                    offset,
+                    match_len,
+                } => {
+                    reconstructed.extend_from_slice(literals);
+                    offsets.push(offset);
+                    let actual = crate::decoding::sequence_execution::do_offset_history(
+                        offset as u32,
+                        literals.len() as u32,
+                        &mut rep,
+                    )
+                    .unwrap()
+                    .get() as usize;
+                    let start = reconstructed.len() - actual;
+                    for i in 0..match_len {
+                        let b = reconstructed[start + i];
+                        reconstructed.push(b);
+                    }
+                },
+            });
+            cursor = block_end;
+        }
+        assert_eq!(reconstructed.len(), data.len() - body);
+        offsets
+    };
+
+    // The pinned frame class keeps the far twin; the strip-keyed resolve
+    // (the unpinned control, the pre-fix job behavior) flips near off the
+    // strip bytes and loses the whole [4K, 16M) class.
+    let pinned = parse(Some(BtDomain::Far));
+    assert!(
+        pinned.iter().any(|&o| o > (1 << 22)),
+        "the pinned far frame must keep the 6 MiB twin"
+    );
+    let strip_keyed = parse(None);
+    assert!(
+        strip_keyed.iter().all(|&o| o <= 4096),
+        "the strip-keyed control must shrink to the near domain"
+    );
+}
+
 /// Far repeats beyond the tree domain must ride LDM candidates on the
 /// opt and btlazy2 rows too (wide W26 frame window, tree domain at the
 /// stock row window): the same shape as the balanced test above, at

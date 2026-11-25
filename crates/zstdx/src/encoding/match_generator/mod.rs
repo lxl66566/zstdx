@@ -936,9 +936,28 @@ impl MatchGeneratorDriver {
     /// streams without buying reach). A pledged stream core does not read
     /// this: it runs the bulk strip ([`Self::strip_for_choice`]) for both
     /// its grid floor and its history span, keeping the pledged bytes on
-    /// the bulk frame's.
+    /// the bulk frame's. The btlazy rows' span keys on the frame's domain
+    /// class through [`Self::stream_overlap_domain_for`]; this form keeps
+    /// the default class.
     pub fn stream_overlap_for(level: Level, shape: InputShape) -> u64 {
-        let p = params_for(level, shape);
+        Self::stream_overlap_domain_for(level, shape, BtDomain::Far)
+    }
+
+    /// [`Self::stream_overlap_for`] under an explicit domain class: the
+    /// dense class re-keys the btlazy rows' span to the stock domain.
+    pub(crate) fn stream_overlap_domain_for(
+        level: Level,
+        shape: InputShape,
+        bt_domain: BtDomain,
+    ) -> u64 {
+        let p = params_for_row(
+            level,
+            shape,
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+            Self::strip_domain(bt_domain),
+        );
         match p.strategy {
             Strategy::Opt(_) | Strategy::BtLazy(_) => p.chain_reach.unwrap_or(p.window) as u64,
             _ => p.window as u64,
@@ -1052,18 +1071,48 @@ impl MatchGeneratorDriver {
         matches!(p.strategy, Strategy::Chain(_)) && p.chain_reach == Some(KEEP_REACH)
     }
 
-    /// [`Self::strip_for_level`] under the frame's reach probe result: a
-    /// shrunk chain domain shrinks the strip with it — the strip needs to
-    /// cover the dense search, and the LDM far class rides within-job
-    /// history (the probe's own measurement priced the near-local shape
-    /// without cross-strip far matches mattering).
+    /// The history strip an MT job borrows (and fully indexes) as its
+    /// match window, under the frame's reach probe result: a shrunk chain
+    /// domain shrinks the strip with it — the strip needs to cover the
+    /// dense search, and the LDM far class rides within-job history (the
+    /// probe's own measurement priced the near-local shape without
+    /// cross-strip far matches mattering). The span is `chain_reach`
+    /// where the row carries one, the window otherwise, and the frame's
+    /// domain class ([`BtDomain`]) keys the btlazy rows' domain — pure
+    /// callers that hold no frame head pass the default.
     #[cfg(feature = "std")]
-    pub(crate) fn strip_for_choice(level: Level, shape: InputShape, choice: ReachChoice) -> u64 {
-        let p = params_for(level, shape);
+    pub(crate) fn strip_for_choice(
+        level: Level,
+        shape: InputShape,
+        choice: ReachChoice,
+        bt_domain: BtDomain,
+    ) -> u64 {
+        let p = params_for_row(
+            level,
+            shape,
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+            Self::strip_domain(bt_domain),
+        );
         if choice == ReachChoice::Shrink && p.chain_reach == Some(KEEP_REACH) {
             SHRINK_REACH as u64
         } else {
             p.chain_reach.unwrap_or(p.window) as u64
+        }
+    }
+
+    /// The strip a frame of the given domain class borrows: the Dense
+    /// class re-keys it to the stock domain (the geometry the R111-era
+    /// frames ran), while the Near class keeps the default row's strip —
+    /// its 4 KiB tree cannot read a wider strip, but the strip still
+    /// carries the LDM's within-job history, and the default span keeps
+    /// the near-class MT frames on their pinned bytes.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    fn strip_domain(bt_domain: BtDomain) -> BtDomain {
+        match bt_domain {
+            BtDomain::Near => BtDomain::Far,
+            domain => domain,
         }
     }
 
@@ -1919,23 +1968,61 @@ impl MatchGeneratorDriver {
     }
 
     /// Resolve the pending btlazy2 domain verdict from the frame's head
-    /// (see [`BtDomain`]): a narrow sampled alphabet shrinks the tree
-    /// ring and search domain for the frame. The resolve's re-apply takes
-    /// the `tables_change` path (the ring log is part of the strategy
-    /// payload), and `strategy_phase_reset` re-arms the DUBT-stale clear
-    /// so the resized tables start from the frame's own fill.
+    /// (see [`BtDomain`]): a narrow sampled alphabet shrinks the tree ring
+    /// and search domain for the frame, a twin-dense wide head keeps the
+    /// stock ladder domain, and a sparse wide head keeps the Far geometry.
+    /// The resolve runs at the frame's first matching entry, where the
+    /// window holds the frame's first block — the same head span the job
+    /// paths resolve from the caller's sample (the btlazy rows run no
+    /// pre-split, so the two spans are identical). The resolve's re-apply
+    /// takes the `tables_change` path (the ring log is part of the strategy
+    /// payload), and `strategy_phase_reset` re-arms the DUBT-stale clear so
+    /// the resized tables start from the frame's own fill.
     fn resolve_bt_domain(&mut self) {
         if let Some(level) = self.bt_domain_pending.take() {
             let head = window_slice(&self.win, self.ext.as_ref());
-            let span = head.len().min(BT_DOMAIN_HEAD_SPAN);
-            if span > 0 && bt_domain_near(&head[..span]) {
-                self.bt_domain = BtDomain::Near;
+            let span = head.len().min(BT_DOMAIN_DENSE_SPAN);
+            let domain = bt_domain_class(&head[..span]);
+            if domain != BtDomain::Far {
+                self.bt_domain = domain;
                 self.apply_level(level);
                 self.strategy_phase_reset();
                 #[cfg(feature = "cfg_dump")]
-                self.cfg_flip("bt_domain_near");
+                self.cfg_flip(if matches!(domain, BtDomain::Near) {
+                    "bt_domain_near"
+                } else {
+                    "bt_domain_dense"
+                });
             }
         }
+    }
+
+    /// Pin the frame's domain class from a head sample the calling entry
+    /// point holds (see [`BtDomain`]): the multithreaded job paths, whose
+    /// first matching entry resolves over strip bytes rather than the
+    /// frame head — a strip tail samples content the head never promised
+    /// (the open stream's middle job flipped Near off its strip tail and
+    /// lost the frame's [4K, 16M) match class for that job). The class is
+    /// per-frame state decided once at the frame's head, so this clears
+    /// the pending resolve the reset armed and the job never re-resolves
+    /// from its strip window.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn set_bt_domain(&mut self, domain: BtDomain, level: Level) {
+        // The verdict owns only the btlazy2 ladder rows (the resolve's own
+        // arming condition); a swapped row (the small-src Opt rows, the
+        // dictionary rows) keeps the reset's default and only the pending
+        // strip resolve dies here.
+        if (13..=15).contains(&level.as_i32())
+            && matches!(self.params.strategy, Strategy::BtLazy(_))
+            && self.bt_domain != domain
+        {
+            self.bt_domain = domain;
+            self.apply_level(level);
+            self.strategy_phase_reset();
+        }
+        self.bt_domain_pending = None;
+        #[cfg(feature = "cfg_dump")]
+        self.cfg_flip("bt_domain_job");
     }
 
     /// Resolve the balanced row's storage verdict from a head sample the
@@ -4929,16 +5016,15 @@ pub(in crate::encoding) use hash::{
 #[cfg(feature = "std")]
 use params::SMALL_SRC_MAX;
 pub(crate) use params::{
-    BALANCED_STORE_HEAD_SPAN, BalancedStore, LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN,
-    LdmArming, balanced_store,
+    BALANCED_STORE_HEAD_SPAN, BT_DOMAIN_DENSE_SPAN, BalancedStore, BtDomain, LDM_FULL_WINDOW,
+    LDM_MIDSIZE_WINDOW, LDM_SYMS_MIN, LdmArming, balanced_store, bt_domain_class,
 };
 use params::{
-    BT_DENSE_LIMIT, BT_DOMAIN_HEAD_SPAN, BtDomain, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS,
-    HEAD_LIMIT, HEAD_MIN_TOTAL, HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS,
-    LdmFill, LevelParams, ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SmallDictRow,
-    SmallSrcRow, Strategy, bt_domain_near, ldm_min_window, params_for, params_for_row,
-    row_attempts_light, sampled_distinct, small_dict_row, small_src_btlazy_head,
-    small_src_class_plain_only, small_src_class_swapped,
+    BT_DENSE_LIMIT, BtStepPhase, HEAD_HASH_LOG, HEAD_KNOBS, HEAD_LIMIT, HEAD_MIN_TOTAL,
+    HEAD_SYMS_MIN, HeadPhase, LDM_CANARY, LDM_QUIET, LEVEL_PARAMS, LdmFill, LevelParams,
+    ROW_ATTEMPTS_HEAD_SPAN, RowAttempts, SMALL_SRC_HEAD_SPAN, SmallDictRow, SmallSrcRow, Strategy,
+    ldm_min_window, params_for, params_for_row, row_attempts_light, sampled_distinct,
+    small_dict_row, small_src_btlazy_head, small_src_class_plain_only, small_src_class_swapped,
 };
 #[cfg(feature = "std")]
 pub(crate) use params::{far_repeat_dominant, ldm_head_parses};

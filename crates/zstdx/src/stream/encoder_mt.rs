@@ -138,8 +138,9 @@ use crate::{
         frame_header::FrameHeader,
         ldm::LdmSeq,
         match_generator::{
-            LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LdmArming, MatchGeneratorDriver, SPF_MIN_PREFIX,
-            SPF_SEG, StripSnapshot, far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
+            BT_DOMAIN_DENSE_SPAN, BtDomain, LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LdmArming,
+            MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot, bt_domain_class,
+            far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
         },
         mt::{
             CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, SerialLdmFeed, btlazy_job_size,
@@ -456,6 +457,11 @@ struct Job {
     /// The frame's reach probe decision (see [`reach_probe`]), shared by
     /// every job so the frame's jobs and its header agree.
     choice: ReachChoice,
+    /// The frame's resolved btlazy domain class (see
+    /// [`MtEncoderCore::bt_domain`]), shared by every job so no job
+    /// resolves it from its strip window; the donation tasks carry the
+    /// default.
+    bt_domain: BtDomain,
     shape: crate::InputShape,
     /// The frame's explicit LDM switch (see [`crate::LdmMode`]), shared by
     /// every job so the frame's parse states agree: `Auto` keeps the job
@@ -931,6 +937,7 @@ fn run_claimed_job(
                             *first as u64,
                             job.ldm_mode,
                             &[],
+                            job.bt_domain,
                         );
                         compress_job_blocks_inner(
                             state,
@@ -967,6 +974,7 @@ fn run_claimed_job(
                         // balanced row's substitution is bulk-only until
                         // the stream-side re-grid and staging port lands.
                         &[],
+                        job.bt_domain,
                     ),
                     // The serial feed's job (the opt rows' far class): the
                     // posted span replaces the driver's own LDM, the
@@ -984,6 +992,7 @@ fn run_claimed_job(
                         JobSpf::Feed(seqs.as_slice(), window),
                         job.ldm_mode,
                         &[],
+                        job.bt_domain,
                     ),
                 }
             };
@@ -1180,6 +1189,13 @@ pub(crate) struct MtEncoderCore {
     /// The frame's reach decision, handed to every job (see
     /// [`reach_probe`]).
     choice: ReachChoice,
+    /// The btlazy rows' domain class (see `match_generator::BtDomain`):
+    /// resolved once at the first job preparation from the frame's head
+    /// bytes the buffer holds then (see [`Self::frame_bt_domain`]) and
+    /// handed to every job, so no job resolves the verdict from its strip
+    /// window — a strip tail samples content the frame head never
+    /// promised. `None` until the first job prepares.
+    bt_domain: Option<BtDomain>,
     /// The frame's dictionary (see [`Job`]'s `dict`): seeds the frame's
     /// first job and its header's dictID/window; `None` on plain frames.
     dict: Option<Arc<crate::encoding::dictionary::EncDictionary>>,
@@ -1304,6 +1320,55 @@ impl MtEncoderCore {
         }
     }
 
+    /// The frame's btlazy domain class, resolved once at the first job
+    /// preparation (see [`Self::bt_domain`]). The buffer holds the
+    /// stream's head bytes at that point on every schedule — a job
+    /// preparation is the first thing that can move `job_start`, and the
+    /// recycle below `movable_lo` cannot move `buf_base` before a job
+    /// posts and completes — so the sample is the frame's true head,
+    /// the same span the bulk dispatch and the single-threaded entries
+    /// resolve over. Dictionary frames keep the never-resolve default
+    /// (the ST dictionary path's own contract), and rows outside the
+    /// btlazy band skip the scan outright.
+    fn frame_bt_domain(&mut self) -> BtDomain {
+        if let Some(domain) = self.bt_domain {
+            return domain;
+        }
+        let domain = if self.dict.is_some() || !(13..=15).contains(&self.level.as_i32()) {
+            BtDomain::Far
+        } else {
+            debug_assert_eq!(self.buf_base, 0);
+            let span = self.input_len().min(BT_DOMAIN_DENSE_SPAN);
+            bt_domain_class(&self.input()[..span])
+        };
+        *self.bt_domain.insert(domain)
+    }
+
+    /// Re-derive the domain-keyed schedule at the class's resolution
+    /// (see [`Self::bt_domain`]): the strip each job borrows and the
+    /// pledged grid's job size both scale with the class's search domain
+    /// (a Dense frame runs the stock 4 MiB domain where the default row
+    /// carries 16 MiB, and the grid with it). Runs before any post — the
+    /// resolution's head span is a fraction of the first posting gate —
+    /// so the re-grid cuts from offset zero and the schedule stays a pure
+    /// function of the input. Default-class frames keep the
+    /// constructor's derivations untouched, and the growing grid needs no
+    /// re-cut: its epochs derive from `overlap` on every read.
+    fn resolve_bt_domain(&mut self) {
+        let domain = self.frame_bt_domain();
+        if domain == BtDomain::Far {
+            return;
+        }
+        let strip = MatchGeneratorDriver::stream_overlap_domain_for(self.level, self.shape, domain)
+            as usize;
+        self.overlap = strip;
+        if let JobGrid::Fixed(_) = self.grid
+            && let Some(n) = self.pledged
+        {
+            self.grid = JobGrid::Fixed(job_size_for_level(self.level, n, self.workers, strip));
+        }
+    }
+
     /// The live input extent: [`Self::input`]'s length, in `buf_base`-
     /// relative coordinates (absolute under the owned feed, whose
     /// `buf_base` stays zero).
@@ -1381,11 +1446,17 @@ impl MtEncoderCore {
         // `stream_overlap_for`): the whole window where cross-job history
         // carries a far class, the search domain where the LDM restarts
         // per job like the bulk path, and a growing grid keyed on it.
+        // The default-domain derivations: a btlazy frame whose head
+        // resolves a narrower domain class re-derives both spans at its
+        // resolution (see [`Self::resolve_bt_domain`]), before any post.
         let (overlap, grid) = match options.pledged_size {
             Some(n) => {
-                let strip =
-                    MatchGeneratorDriver::strip_for_choice(options.level, shape, ReachChoice::Keep)
-                        as usize;
+                let strip = MatchGeneratorDriver::strip_for_choice(
+                    options.level,
+                    shape,
+                    ReachChoice::Keep,
+                    BtDomain::Far,
+                ) as usize;
                 (
                     strip,
                     JobGrid::Fixed(job_size_for_level(options.level, n, options.workers, strip)),
@@ -1546,6 +1617,7 @@ impl MtEncoderCore {
             donation: None,
             fast_capture,
             choice: ReachChoice::Keep,
+            bt_domain: None,
             dict,
             header_dict_id,
 
@@ -2126,6 +2198,7 @@ impl MtEncoderCore {
         let keep = Arc::new(Job {
             level: self.level,
             choice: ReachChoice::Keep,
+            bt_domain: BtDomain::Far,
             dict: None,
             shape: self.shape,
             ldm_mode: self.ldm_mode,
@@ -2139,6 +2212,7 @@ impl MtEncoderCore {
         let shrink = Arc::new(Job {
             level: self.level,
             choice: ReachChoice::Keep,
+            bt_domain: BtDomain::Far,
             dict: None,
             shape: self.shape,
             ldm_mode: self.ldm_mode,
@@ -2329,7 +2403,12 @@ impl MtEncoderCore {
         // the span widens from the stock strip to the clamped window, the
         // bulk dispatch's own `capture_window` fold of `job_overlap`.
         self.overlap = window as usize;
-        let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, self.choice);
+        let reach = MatchGeneratorDriver::strip_for_choice(
+            self.level,
+            self.shape,
+            self.choice,
+            BtDomain::Far,
+        );
         // The bulk capture's grid is pinned (see `mt::capture_grid`):
         // worker-independent, so the pledged stream re-grids onto the
         // same lattice the bulk path runs and the two stay byte-identical
@@ -2594,7 +2673,12 @@ impl MtEncoderCore {
         };
         // The retain's bar is the stock strip — the same reach the bulk
         // gate filters with — captured before the widening below.
-        let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, self.choice);
+        let reach = MatchGeneratorDriver::strip_for_choice(
+            self.level,
+            self.shape,
+            self.choice,
+            BtDomain::Far,
+        );
         self.feed = Some(SerialLdmFeed::new(window, reach, n));
         self.overlap = window as usize;
         self.opt_feed = OptFeed::Engaged;
@@ -2636,7 +2720,12 @@ impl MtEncoderCore {
     /// Shrink verdict drops the plan, so the prediction never diverges
     /// from a verdict that could keep it: same buffer, same reach).
     fn far_screens_dead(&self, choice: ReachChoice) -> bool {
-        let reach = MatchGeneratorDriver::strip_for_choice(self.level, self.shape, choice) as usize;
+        let reach = MatchGeneratorDriver::strip_for_choice(
+            self.level,
+            self.shape,
+            choice,
+            self.bt_domain.unwrap_or(BtDomain::Far),
+        ) as usize;
         if self.overlap <= reach
             || self.input_len() < reach_probe::PROBE_SPAN
             || ldm_head_parses(&self.input()[..reach_probe::PROBE_SPAN])
@@ -2658,6 +2747,7 @@ impl MtEncoderCore {
                 self.level,
                 self.shape,
                 self.choice,
+                self.bt_domain.unwrap_or(BtDomain::Far),
             ) as usize)
         } else {
             self.overlap
@@ -2812,6 +2902,14 @@ impl MtEncoderCore {
     /// pledged grid holds its final job back for `finish` to mark last
     /// (unlocked on overshoot, where the bulk path also stops holding).
     fn post_ready(&mut self) {
+        // The btlazy rows' domain class resolves from the buffered head
+        // before any post can fire — the posting gates below need whole
+        // jobs buffered, the head sample a fraction of that — so the
+        // domain-keyed schedule re-derives over a frame nothing has
+        // encoded yet (see [`Self::resolve_bt_domain`]).
+        if self.bt_domain.is_none() && self.pos >= BT_DOMAIN_DENSE_SPAN as u64 {
+            self.resolve_bt_domain();
+        }
         if self.probe_pending {
             // Nothing posts until the probe's head is staged and decided
             // (see the module docs) — the schedule below must never see a
@@ -3359,6 +3457,9 @@ impl MtEncoderCore {
                 _ => JobSpf::None,
             }
         };
+        // The frame's domain class resolves before the input borrow
+        // (the head scan reads the buffer immutably).
+        let bt_domain = self.frame_bt_domain();
         let bytes = run_job_with(
             &mut state,
             &self.input()[src_lo..src_hi],
@@ -3374,6 +3475,7 @@ impl MtEncoderCore {
             // Stock chain jobs on the stream cores (see the posted-job
             // arm above).
             &[],
+            bt_domain,
         );
         return_pooled_state(state);
         self.push_out_segment(bytes);
@@ -3461,6 +3563,7 @@ impl MtEncoderCore {
         let job = Arc::new(Job {
             level: self.level,
             choice: self.choice,
+            bt_domain: self.frame_bt_domain(),
             shape: self.shape,
             ldm_mode: self.ldm_mode,
             dict: (start == 0).then(|| self.dict.clone()).flatten(),
@@ -4627,6 +4730,7 @@ mod tests {
         let job = Arc::new(Job {
             level: Level::Fastest,
             choice: ReachChoice::Keep,
+            bt_domain: BtDomain::Far,
             shape: InputShape {
                 len: None,
                 window_log: None,
@@ -4674,6 +4778,7 @@ mod tests {
             Arc::new(Job {
                 level: Level::Fastest,
                 choice: ReachChoice::Keep,
+                bt_domain: BtDomain::Far,
                 shape: InputShape {
                     len: None,
                     window_log: None,
@@ -4765,6 +4870,7 @@ mod tests {
         let job = Arc::new(Job {
             level: Level::Fastest,
             choice: ReachChoice::Keep,
+            bt_domain: BtDomain::Far,
             shape: InputShape {
                 len: None,
                 window_log: None,

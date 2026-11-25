@@ -37,9 +37,9 @@ use super::{
     frame_header::FrameHeader,
     ldm::{LdmSeq, LdmState},
     match_generator::{
-        BALANCED_STORE_HEAD_SPAN, BalancedStore, LDM_FULL_WINDOW, LdmArming, LdmPrefixSnapshot,
-        MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot, balanced_store,
-        ldm_head_parses,
+        BALANCED_STORE_HEAD_SPAN, BT_DOMAIN_DENSE_SPAN, BalancedStore, BtDomain, LDM_FULL_WINDOW,
+        LdmArming, LdmPrefixSnapshot, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
+        balanced_store, bt_domain_class, ldm_head_parses,
     },
     reach_probe,
 };
@@ -128,7 +128,8 @@ pub fn mt_job_size_for(
     } else {
         reach_probe::probe_reach_choice(head, level, shape)
     };
-    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
+    let bt_domain = bt_domain_class(&head[..head.len().min(BT_DOMAIN_DENSE_SPAN)]);
+    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice, bt_domain) as usize;
     // Capture frames pin the grid at the reach floor (worker-independent
     // — see `capture_grid`); the analysis tools must cut at the grid the
     // encoder actually runs. `head` is the whole input (the screen clamps
@@ -168,7 +169,8 @@ pub fn mt_job_overlap_for(
     } else {
         reach_probe::probe_reach_choice(head, level, shape)
     };
-    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
+    let bt_domain = bt_domain_class(&head[..head.len().min(BT_DOMAIN_DENSE_SPAN)]);
+    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice, bt_domain) as usize;
     let fast_window = far_screen::mt_capture_window(level, shape, head);
     let job_size = capture_grid(
         len,
@@ -230,7 +232,8 @@ pub fn mt_frame_strip_for(level: Level, shape: crate::InputShape, head: &[u8]) -
     } else {
         reach_probe::probe_reach_choice(head, level, shape)
     };
-    MatchGeneratorDriver::strip_for_choice(level, shape, choice)
+    let bt_domain = bt_domain_class(&head[..head.len().min(BT_DOMAIN_DENSE_SPAN)]);
+    MatchGeneratorDriver::strip_for_choice(level, shape, choice, bt_domain)
 }
 
 /// Compress `src` into one frame using up to `workers` threads.
@@ -335,11 +338,24 @@ pub fn compress_slice_mt(
     #[cfg(feature = "cfg_dump")]
     let donation_donated = donation.is_some();
     let donation = Mutex::new(donation);
+    // The btlazy rows' domain class, resolved once from the frame's head
+    // before any schedule reads the domain (the ST entry's own resolution
+    // reads the same span at its first matching entry): every job carries
+    // the frame's class, so a job never resolves the verdict from its
+    // strip window — a strip tail samples content the frame head never
+    // promised — and the strip-keyed grid below runs the resolved class's
+    // own geometry. Dictionary frames keep the never-resolve default the
+    // ST dictionary path holds.
+    let bt_domain = if dict.is_some() || !(13..=15).contains(&level.as_i32()) {
+        BtDomain::Far
+    } else {
+        bt_domain_class(&head[..head.len().min(BT_DOMAIN_DENSE_SPAN)])
+    };
     // The stock strip: the search domain the plain jobs prefill, the plain
     // grid's floor and the fallback job history. The banded classes widen
     // the history below (`job_overlap`); the grid stays the strip's or the
     // capture lattice's own pin.
-    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize;
+    let strip = MatchGeneratorDriver::strip_for_choice(level, shape, choice, bt_domain) as usize;
     let capture = capture_grid(
         src.len() as u64,
         level,
@@ -690,6 +706,7 @@ pub fn compress_slice_mt(
                             snapshot.job_spf(),
                             ldm_mode,
                             bal_head,
+                            bt_domain,
                         )
                     }));
                     #[cfg(feature = "job_trace")]
@@ -889,13 +906,20 @@ fn resolve_reach_gate(
         && job_size_for(
             src.len() as u64,
             workers.max(2),
-            MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
-                as usize,
+            MatchGeneratorDriver::strip_for_choice(
+                level,
+                shape,
+                reach_probe::ReachChoice::Keep,
+                BtDomain::Far,
+            ) as usize,
         ) >= reach_probe::PROBE_SPAN
     {
-        let keep_strip =
-            MatchGeneratorDriver::strip_for_choice(level, shape, reach_probe::ReachChoice::Keep)
-                as usize;
+        let keep_strip = MatchGeneratorDriver::strip_for_choice(
+            level,
+            shape,
+            reach_probe::ReachChoice::Keep,
+            BtDomain::Far,
+        ) as usize;
         // Capture frames pin the job grid at the reach floor instead of
         // the worker-scaled formula: the grid (and with it the frame
         // bytes) stays identical at every worker count, and the floor
@@ -1865,7 +1889,7 @@ fn capture_grid(
     let window = capture_band(level, shape, choice, head, fast_window, ldm_mode)?.window();
     let job_size = capture_job_size(
         len,
-        MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize,
+        MatchGeneratorDriver::strip_for_choice(level, shape, choice, BtDomain::Far) as usize,
     );
     // Eight jobs' worth of input, clamped to the [reach floor, 16 MiB]
     // band (see `capture_job_size`): the floor is where the mid-size
@@ -2168,6 +2192,7 @@ fn build_ldm_prefix_chain(
 /// there). The prefix of [`run_job_with`] shared with the streaming
 /// core's pre-built prefix-fill state (see `encoder_mt::build_spf`),
 /// whose state is prepared before it is handed to a worker.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_job_state(
     state: &mut CompressState<MatchGeneratorDriver>,
     level: Level,
@@ -2177,6 +2202,7 @@ pub(crate) fn prepare_job_state(
     job_start: u64,
     ldm_mode: crate::LdmMode,
     bal_head: &[u8],
+    bt_domain: BtDomain,
 ) {
     reset_slice_state_mode(state, level, shape, choice, ldm, ldm_mode);
     // The plain jobs' storage verdict (see `plain_job_balanced_store`): a
@@ -2187,6 +2213,11 @@ pub(crate) fn prepare_job_state(
     if !bal_head.is_empty() {
         state.matcher.consider_balanced_store(bal_head, level);
     }
+    // The btlazy rows' domain class: the frame's own head resolved it (see
+    // `compress_slice_mt`'s resolution and the stream core's own), so the
+    // job never re-resolves from its strip window — a strip tail samples
+    // content the frame head never promised.
+    state.matcher.set_bt_domain(bt_domain, level);
     if job_start > 0 {
         state.matcher.gate_repcodes();
         let depth = ramp_depth_from_env();
@@ -2226,6 +2257,7 @@ pub(crate) fn run_job_with(
     spf: JobSpf<'_>,
     ldm_mode: crate::LdmMode,
     bal_head: &[u8],
+    bt_domain: BtDomain,
 ) -> Vec<u8> {
     #[cfg(feature = "job_trace")]
     let trace_reset = std::time::Instant::now();
@@ -2238,13 +2270,14 @@ pub(crate) fn run_job_with(
         job.start as u64,
         ldm_mode,
         bal_head,
+        bt_domain,
     );
     #[cfg(feature = "job_trace")]
     super::job_trace::add_reset(trace_reset);
     // The windowed band's chain tables cover the reach tail; every other
     // engagement indexes the whole strip `overlap` names.
     let chain_overlap = if matches!(spf, JobSpf::Windowed(_) | JobSpf::Feed(..)) {
-        MatchGeneratorDriver::strip_for_choice(level, shape, choice) as usize
+        MatchGeneratorDriver::strip_for_choice(level, shape, choice, bt_domain) as usize
     } else {
         overlap
     };
@@ -2278,6 +2311,7 @@ pub(crate) fn run_job(
     spf: JobSpf<'_>,
     ldm_mode: crate::LdmMode,
     bal_head: &[u8],
+    bt_domain: BtDomain,
 ) -> Vec<u8> {
     let mut state = take_pooled_slice_state(level, shape, choice, ldm);
     let output = run_job_with(
@@ -2293,6 +2327,7 @@ pub(crate) fn run_job(
         spf,
         ldm_mode,
         bal_head,
+        bt_domain,
     );
     return_pooled_slice_state(state);
     output
@@ -2314,7 +2349,8 @@ mod tests {
         decoding::FrameDecoder,
         encoding::{
             match_generator::{
-                BalancedStore, LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver, balanced_store,
+                BalancedStore, BtDomain, LDM_FULL_WINDOW, LdmArming, MatchGeneratorDriver,
+                balanced_store,
             },
             reach_probe::ReachChoice,
         },
@@ -2644,9 +2680,12 @@ mod tests {
                 len: Some(len),
                 window_log,
             };
-            let strip =
-                MatchGeneratorDriver::strip_for_choice(Level::Balanced, shape, ReachChoice::Keep)
-                    as usize;
+            let strip = MatchGeneratorDriver::strip_for_choice(
+                Level::Balanced,
+                shape,
+                ReachChoice::Keep,
+                BtDomain::Far,
+            ) as usize;
             // The planner pins the capture grid (see `compress_slice_mt`).
             let job_size = capture_grid(
                 len,
@@ -2689,9 +2728,12 @@ mod tests {
             len: Some(24 * mib),
             window_log: None,
         };
-        let strip =
-            MatchGeneratorDriver::strip_for_choice(Level::Balanced, shape, ReachChoice::Keep)
-                as usize;
+        let strip = MatchGeneratorDriver::strip_for_choice(
+            Level::Balanced,
+            shape,
+            ReachChoice::Keep,
+            BtDomain::Far,
+        ) as usize;
         let job_size = job_size_for(shape.len.unwrap(), 2, strip);
         let plan = plan_prefix_ldm(
             &vec![0u8; MAX_BLOCK_SIZE as usize],

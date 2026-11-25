@@ -860,21 +860,27 @@ const fn row_light_search_depth(level: i32) -> Option<u32> {
 }
 
 /// The btlazy2 ladder rows' (13-15) tree search domain class, decided by
-/// the frame head's sampled alphabet (see [`bt_domain_near`]) — the same
-/// separating evidence the balanced row's storage twin and the row band's
-/// attempts diet key on, resolving the same split: a narrow head's repeats
-/// are near-local (json logs, tiled structured data), where a wide tree
-/// domain only feeds the selection far candidates whose offsets cost more
-/// than the literals they displace (json at a 4 KiB domain measures 3
-/// percent smaller than at 4 MiB), while a wide head's duplicated mass
-/// lives in the multi-megabyte distance classes a narrow tree can never
-/// reach (jsonreal's 4-16 MiB class covers 8 percent of its matched bytes
-/// at the balanced row's twin, textreal improves 3 percent from 4 to 16
-/// MiB, and text's tile period pins the floor: its repeats sit at 839 KiB,
-/// so a narrow-class text frame would lose its whole match mass). Every
-/// frame and every MT job starts at [`BtDomain::Far`]; the verdict is
-/// per-frame state resolved at the first matching entry (a job samples
-/// its strip content, deterministic by the job grid), and pure
+/// the frame head's sampled alphabet (see [`bt_domain_near`]) and twin
+/// density (see [`bt_domain_dense`]) — the same separating evidence the
+/// balanced row's storage twin and the row band's attempts diet key on,
+/// resolving the same split: a narrow head's repeats are near-local (json
+/// logs, tiled structured data), where a wide tree domain only feeds the
+/// selection far candidates whose offsets cost more than the literals
+/// they displace (json at a 4 KiB domain measures 3 percent smaller than at
+/// 4 MiB), while a wide head's duplicated mass lives in the
+/// multi-megabyte distance classes a narrow tree can never reach
+/// (jsonreal's 4-16 MiB class covers 8 percent of its matched bytes at the
+/// balanced row's twin, textreal improves 3 percent from 4 to 16 MiB, and
+/// text's tile period pins the floor: its repeats sit at 839 KiB, so a
+/// narrow-class text frame would lose its whole match mass). The
+/// [`BtDomain::Dense`] class caps the wide head whose long-prefix twins
+/// make the 16 MiB ring's compare volume the parse's own wall (the
+/// concatenated-binary class): the ring's density gain is hundredths of a
+/// percent there while its compare volume collapses the tier. Every frame
+/// and every MT job starts at [`BtDomain::Far`]; the verdict is per-frame
+/// state resolved once from the frame head (the single-threaded entries
+/// at their first matching entry, the job paths from the caller's resolved
+/// class — see [`MatchGeneratorDriver::set_bt_domain`]), and pure
 /// `(level, shape)` queries never resolve one, so headers and strip
 /// geometry keep the Far row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -887,6 +893,11 @@ pub(crate) enum BtDomain {
     /// shrink reach ([`SHRINK_REACH`], measured optimal for the json
     /// class), with the tree ring sized to it.
     Near,
+    /// Twin-dense wide heads (see [`bt_domain_dense`]): the stock ladder
+    /// domain — a 4 MiB ring and reach, the pre-domain-verdict geometry,
+    /// where the wide ring's compare volume bought only hundredths of a
+    /// percent of density on the binary class.
+    Dense,
 }
 
 /// Head sample the domain verdict reads: the same 8 KiB span the
@@ -900,9 +911,92 @@ pub(crate) const BT_DOMAIN_HEAD_SPAN: usize = 8 * 1024;
 const BT_DOMAIN_NEAR_SYMS: u32 = 48;
 
 /// Whether a frame head's sampled alphabet takes [`BtDomain::Near`] (see
-/// [`BtDomain`]). A pure function of the head bytes.
+/// [`BtDomain`]). A pure function of the head bytes, over the verdict's
+/// own 8 KiB sample span whatever longer head the caller holds.
 pub(crate) fn bt_domain_near(head: &[u8]) -> bool {
-    sampled_distinct(head, 0, head.len()) < BT_DOMAIN_NEAR_SYMS
+    let span = head.len().min(BT_DOMAIN_HEAD_SPAN);
+    sampled_distinct(head, 0, span) < BT_DOMAIN_NEAR_SYMS
+}
+
+/// The dense-class scan's sample span: the first block's worth of head
+/// bytes, the same span every path's resolution can see (the btlazy rows
+/// run no pre-split, so the single-threaded entry's first-matching-entry
+/// window and the multithreaded frame-head sample are this exact span).
+pub(crate) const BT_DOMAIN_DENSE_SPAN: usize = 128 * 1024;
+
+/// The dense-class scan's sample stride and key width.
+const BT_DENSE_STRIDE: usize = 64;
+const BT_DENSE_KEY: usize = 8;
+
+/// The dense-class bar on a sampled twin's forward common length: the
+/// compare-volume class the wide ring multiplies. Structured-text repeats
+/// (jsonreal's key names, text's tiles) run under it; the binary class's
+/// multi-hundred-byte twins (dll100's ELF mix: 39 of 2047 samples at 512
+/// bytes or more) run over it.
+const BT_DENSE_COMMON: usize = 512;
+
+/// The dense-class verdict bar: the sample fraction whose 8-byte key hits
+/// an earlier sample with at least [`BT_DENSE_COMMON`] common bytes.
+/// dll100 and dll32 read 1.9 percent, jsonreal 0.24, textreal/text and
+/// every narrow head 0, so the bar sits mid-gap on both margins.
+const BT_DENSE_MIN: usize = 128;
+
+/// The dense-class scan's slot count (latest-wins, one slot per key hash).
+const BT_DENSE_SLOTS: usize = 4096;
+const BT_DENSE_PRIME: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Whether a frame head takes [`BtDomain::Dense`] (see [`BtDomain`]): the
+/// sampled head holds long-prefix twins at a density that makes the wide
+/// ring's compare volume the parse's own cost. A pure function of the
+/// head bytes — an 8-byte-key latest-wins scan at [`BT_DENSE_STRIDE`],
+/// counting hits whose forward common length reaches
+/// [`BT_DENSE_COMMON`].
+pub(crate) fn bt_domain_dense(head: &[u8]) -> bool {
+    let span = head.len().min(BT_DOMAIN_DENSE_SPAN);
+    if span < BT_DENSE_KEY {
+        return false;
+    }
+    let mut hashes = [0u32; BT_DENSE_SLOTS];
+    let mut poss = [u32::MAX; BT_DENSE_SLOTS];
+    let mut samples = 0usize;
+    let mut hits = 0usize;
+    let mut p = 0usize;
+    while p + BT_DENSE_KEY <= span {
+        let key = u64::from_le_bytes(head[p..p + BT_DENSE_KEY].try_into().unwrap());
+        let hash = (key.wrapping_mul(BT_DENSE_PRIME) >> 32) as u32;
+        let slot = (hash >> 20) as usize;
+        let prev = poss[slot] as usize;
+        // A stale hash match only inflates the compare count: the forward
+        // compare below rejects any false twin before it can count.
+        if prev != u32::MAX as usize && hashes[slot] == hash {
+            let mut n = 0usize;
+            while n < BT_DENSE_COMMON && p + n < span && head[prev + n] == head[p + n] {
+                n += 1;
+            }
+            if n >= BT_DENSE_COMMON {
+                hits += 1;
+            }
+        }
+        hashes[slot] = hash;
+        poss[slot] = p as u32;
+        samples += 1;
+        p += BT_DENSE_STRIDE;
+    }
+    samples > 0 && hits * BT_DENSE_MIN >= samples
+}
+
+/// The frame head's domain class (see [`BtDomain`]): the narrow-alphabet
+/// bar first, then the dense-twin scan on the wide remainder. A pure
+/// function of the head bytes; every resolution path feeds it the same
+/// head span (see [`BT_DOMAIN_DENSE_SPAN`]).
+pub(crate) fn bt_domain_class(head: &[u8]) -> BtDomain {
+    if bt_domain_near(head) {
+        BtDomain::Near
+    } else if bt_domain_dense(head) {
+        BtDomain::Dense
+    } else {
+        BtDomain::Far
+    }
 }
 
 /// The balanced row's candidate storage, decided by the frame head's
@@ -1143,19 +1237,31 @@ pub(super) const fn params_for_row(
     }
     // The btlazy rows' domain class (see [`BtDomain`]): a near-local head
     // shrinks the tree ring and search domain to the chain row's probe
-    // shrink reach. Only the ladder rows 13-15 reach here as btlazy2 —
-    // the small-src swap rows returned above, and the level guard keeps a
-    // future btlazy row out of the substitution until its class is
-    // measured.
-    if matches!(bt_domain, BtDomain::Near)
-        && matches!(level.as_i32(), 13..=15)
+    // shrink reach; a twin-dense wide head keeps the stock ladder domain
+    // (the wide ring's compare volume outweighs its density there). Only
+    // the ladder rows 13-15 reach here as btlazy2 — the small-src swap
+    // rows returned above, and the level guard keeps a future btlazy row
+    // out of the substitution until its class is measured.
+    if matches!(level.as_i32(), 13..=15)
         && let Strategy::BtLazy(knobs) = p.strategy
     {
-        p.strategy = Strategy::BtLazy(OptKnobs {
-            bt_log: SHRINK_REACH.trailing_zeros(),
-            ..knobs
-        });
-        p.chain_reach = Some(SHRINK_REACH);
+        match bt_domain {
+            BtDomain::Near => {
+                p.strategy = Strategy::BtLazy(OptKnobs {
+                    bt_log: SHRINK_REACH.trailing_zeros(),
+                    ..knobs
+                });
+                p.chain_reach = Some(SHRINK_REACH);
+            },
+            BtDomain::Dense => {
+                p.strategy = Strategy::BtLazy(OptKnobs {
+                    bt_log: 22,
+                    ..knobs
+                });
+                p.chain_reach = Some(1 << 22);
+            },
+            BtDomain::Far => {},
+        }
     }
     // Small-input policy (libzstd's small-src rows run searchLength 4 at
     // every lazy-family level): the row matcher's default 5 prices
@@ -1369,8 +1475,9 @@ fn small_dict_opt_row(level: i32, window: usize, shape: InputShape) -> Option<Le
 /// unchanged. The count is pinned by [`LADDER_ROW_COLLISIONS`] below, so
 /// a ladder edit that adds or removes a collision fails the build and
 /// forces a re-verification of the lockstep branch.
+#[allow(clippy::too_many_lines)]
 const fn prove_ladder_geometry() -> usize {
-    const VARIANTS: [(SmallSrcRow, RowAttempts, BalancedStore, BtDomain); 20] = [
+    const VARIANTS: [(SmallSrcRow, RowAttempts, BalancedStore, BtDomain); 30] = [
         (
             SmallSrcRow::Btlazy,
             RowAttempts::Stock,
@@ -1490,6 +1597,66 @@ const fn prove_ladder_geometry() -> usize {
             RowAttempts::Stock,
             BalancedStore::RowHead,
             BtDomain::Near,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::Chain,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Light,
+            BalancedStore::Chain,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Light,
+            BalancedStore::Chain,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::Row,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::Row,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Light,
+            BalancedStore::Row,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Light,
+            BalancedStore::Row,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Btlazy,
+            RowAttempts::Stock,
+            BalancedStore::RowHead,
+            BtDomain::Dense,
+        ),
+        (
+            SmallSrcRow::Stock,
+            RowAttempts::Stock,
+            BalancedStore::RowHead,
+            BtDomain::Dense,
         ),
     ];
     let mut collisions = 0usize;
@@ -1605,14 +1772,15 @@ const fn prove_ladder_geometry() -> usize {
 /// rehead branch. A ladder edit that moves this number fails the build —
 /// re-verify the lockstep branch in `resize_tables` (the R68 bug #3
 /// precondition: same row count at different hash logs).
-// The verdict axes grew to twenty cells (the btlazy domain verdict
-// doubled them; BtDomain cannot change row-strategy geometry — the Near
-// substitution only touches Strategy::BtLazy rows — so the count
-// doubled exactly, 2 x 4148), pushing the full-grid walk past the lint's
-// step budget; the proof itself is finite and completes.
+// The verdict axes grew to thirty cells (the btlazy domain verdict's
+// dense class tripled them; BtDomain cannot change row-strategy
+// geometry — the Near and Dense substitutions only touch
+// Strategy::BtLazy rows — so the count tripled exactly, 3 x 4148),
+// pushing the full-grid walk past the lint's step budget; the proof
+// itself is finite and completes.
 #[allow(long_running_const_eval)]
 const LADDER_ROW_COLLISIONS: usize = prove_ladder_geometry();
 const _: () = assert!(
-    LADDER_ROW_COLLISIONS == 8296,
+    LADDER_ROW_COLLISIONS == 12444,
     "row-geometry collision count moved: re-verify resize_tables' rows-kept lockstep branch"
 );
