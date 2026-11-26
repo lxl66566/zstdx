@@ -4066,6 +4066,14 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn start_matching_codes(&mut self, literals: &mut Vec<u8>, seqs: &mut Vec<SeqWord>) {
+        // The scan's literal store budget, established once up front (the
+        // overrun module's per-block contract): every literal the block can
+        // stage sits in the pending span `[anchor, block_end)` — each block
+        // byte enters the stream at most once — and the 8-byte word store
+        // of a short literal run may overrun the published length by up to
+        // 7 bytes. `push_seq_packed`'s stores rely on this reserve instead
+        // of re-checking the capacity per sequence.
+        literals.reserve(IdxRange::new(self.anchor, self.block_end).len() as usize + 8);
         self.start_matching_codes_inner(literals, seqs);
         // The parse read the window up to the block end; the wall past
         // the staged tail must be intact (the wrapper covers every

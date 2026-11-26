@@ -617,17 +617,14 @@ pub(in crate::encoding) fn push_seq_packed(
         return (0, start + match_len);
     }
     if lits.len() <= 8 && anchor_idx + 8 <= win.len() {
-        // SAFETY: the 8-byte read stays in bounds because the anchor plus 8
-        // fits the window; the overrun store spills up to 7 bytes past the
-        // published length, covered by the reserve (`common::overrun`), and
-        // later pushes overwrite them.
         let v = read8(win, anchor_idx);
-        // SAFETY: the reserve covers the 8-byte store and the publish keeps
-        // the length at the written prefix, so `literals` never exposes
-        // uninitialized bytes. The little-endian store reproduces read8's
-        // little-endian value as the same bytes on every target.
+        // SAFETY: the scan's per-block reserve (start_matching_codes)
+        // covers the 8-byte store — the block's literals stay inside the
+        // reserved span — and the publish keeps the length at the written
+        // prefix, so `literals` never exposes uninitialized bytes. The
+        // little-endian store reproduces read8's little-endian value as
+        // the same bytes on every target.
         unsafe {
-            literals.reserve(8);
             let end = literals.len();
             overrun::store_u64(literals, end, v);
             overrun::publish_len(literals, end + lits.len());
@@ -640,21 +637,18 @@ pub(in crate::encoding) fn push_seq_packed(
     (ll, start + match_len)
 }
 
-/// Index a match's covered range (the fast strategy's fill policy).
-/// Short matches keep every position (they carry the alignment coverage on
-/// structured data). Long matches only index two anchors (zstd fast's fill
-/// policy): one just inside the start, one just before the end — the scan
-/// loop already indexes the positions it probes, so interior coverage only
-/// needs seed points for the phases the scan skips over, and hashing a
-/// 4-byte grid across long matches dominated encoder time. Both anchors
-/// need HASH_READ bytes of window ahead; a match reaching the insert bound
-/// simply leaves them out. Outlined from [`TableEmit::emit`] (see there).
+/// Index a match's covered range (the chain strategies' fill policy).
+/// Short matches keep every position (the dense-interior rows need the
+/// phase coverage), long matches only a coarse grid, and every covered
+/// position enters through [`insert_linked_at`]: a head entry without
+/// its link parks a candidate the walk side cannot trust. Outlined from
+/// [`TableEmit::emit_linked`] (see there).
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn insert_covered(
     win: &[u8],
     table: TableHandle,
-    chain: Option<TableHandle>,
+    links: TableHandle,
     win_base: u64,
     start: usize,
     match_len: usize,
@@ -664,18 +658,9 @@ pub(super) fn insert_covered(
     width: ChainHashWidth,
     origin: u64,
 ) {
-    // One insert form per fill site: the chain strategies link every
-    // covered position they head-insert (see `insert_linked_at`), the fast
-    // strategy has no chain to link (and no origin — its tables are
-    // cleared per job, the shift stays 0).
     macro_rules! put {
         ($pos:expr) => {
-            match chain {
-                Some(links) => insert_linked_at(win, table, links, $pos, log, width, origin),
-                // The fast arm has no chain and no origin; its tables are
-                // cleared per job, so the epoch shift stays 0.
-                None => insert_at(win, table, $pos, 0, log),
-            }
+            insert_linked_at(win, table, links, $pos, log, width, origin)
         };
     }
     if match_len <= 16 {
@@ -764,10 +749,10 @@ pub(super) struct TableEmit<'a> {
     /// Log of `table` (the fast strategy's hash log).
     pub(super) hash_log: u32,
     /// Short-match interior fill policy of this block (density-coupled;
-    /// see [`CoveredFill`]). Only `emit` reads it.
+    /// see [`CoveredFill`]). Only the covered fills read it.
     pub(super) covered_fill: CoveredFill,
-    /// The chain-table hash width (fast rows always pass `Six`; only the
-    /// linked arm of `insert_covered` reads it).
+    /// The chain-table hash width; only the chain arm of [`insert_covered`]
+    /// reads it.
     pub(super) width: ChainHashWidth,
     /// The chain heads' coordinate origin (`head_origin` on the driver);
     /// only the chain emit paths read it — the fast strategy's tables
@@ -781,15 +766,101 @@ pub(super) struct TableEmit<'a> {
 }
 
 impl TableEmit<'_> {
+    /// The fast family's covered fill, outlined for the same inliner-budget
+    /// reason as [`insert_covered`] but reading the fill constants off the
+    /// emit context: the fast rows have no chain table, no origin and no
+    /// dictionary fill, so the call carries three register arguments where
+    /// the general form passes five stack slots and reloads the caller's
+    /// context after the return (the fill sites sit inside the scan loop,
+    /// once per emitted sequence).
+    ///
+    /// Short matches keep every covered position (they carry the alignment
+    /// coverage on structured data); long matches only index two anchors —
+    /// one just inside the start, one just before the end (zstd fast's fill
+    /// policy): the scan loop already indexes the positions it probes, so
+    /// interior coverage only needs seed points for the phases the scan
+    /// skips over. Both anchors need [`HASH_READ`] bytes of window ahead; a
+    /// match reaching the insert bound simply leaves them out.
+    #[inline(never)]
+    pub(super) fn insert_covered_fast(&self, win: &[u8], start: usize, match_len: usize) {
+        // One plain head insert per covered position (the fast tables have
+        // no links and no origin; their epoch shift is 0).
+        macro_rules! put {
+            ($pos:expr) => {
+                insert_at(
+                    win,
+                    self.table,
+                    WinPos::new(self.win_base, $pos),
+                    0,
+                    self.hash_log,
+                )
+            };
+        }
+        if match_len <= 16 {
+            let mut p = self.win_base + start as u64;
+            let end = (p + match_len as u64).min(self.insert_max);
+            // The clamp can fall below p — tiny windows saturate
+            // insert_max to win_base, and rep-chain tails emit to
+            // MIN_MATCH of the block end, not HASH_READ. Bail on the empty
+            // range: the wrapped `end - p` below would peel-insert one
+            // position whose hash reads past the window (fuzz-found heap
+            // overread).
+            if p >= end {
+                return;
+            }
+            // The `p >= end` guard above proves the pair order, so the naked
+            // span arithmetic below cannot wrap.
+            // Density-gated stride-2 form first, so the dense path below
+            // stays instruction-identical on the shapes that never gate
+            // (the branch lives in this outlined body, never in the scan
+            // loop).
+            if self.covered_fill == CoveredFill::Strided {
+                // Kept rolled: the modal gated match holds 3-4 stride-2
+                // inserts, where an unrolled pair form's peel and tail
+                // checks cost more than they save (measured on dll100).
+                while p < end {
+                    put!(p);
+                    p += 2;
+                }
+                return;
+            }
+            // Peel the odd tail before the loop: `while p < end` alone
+            // unrolls mod 2 behind a per-entry parity guard that
+            // mispredicts on every other insert (measured on
+            // json.fastest).
+            if (end - p) & 1 == 1 {
+                put!(p);
+                p += 1;
+            }
+            while p < end {
+                put!(p);
+                put!(p + 1);
+                p += 2;
+            }
+        } else {
+            // match_len > 16 on this branch, so the -2 cannot wrap.
+            let base = self.win_base + start as u64;
+            let hi = base + match_len as u64 - 2;
+            if hi <= self.insert_max {
+                let lo = base + 2;
+                put!(lo);
+                if hi > lo {
+                    put!(hi);
+                }
+            }
+        }
+    }
+
     /// Emit the sequence for a match covering `match_len` bytes at window
     /// index `start`, update the repeated-offset history, index the covered
     /// range and return the new cursor (which is also the new anchor). The
     /// sequence is pushed straight into the packed code/add-bits streams the
     /// block encoder consumes — the raw (ll, ml, of) triple never gets its
-    /// own buffer. The coverage indexing is outlined ([`insert_covered`]):
-    /// with it inline, the whole helper grew past the inliner's budget, and
-    /// every scan-loop call site paid a full spill/reload of the emit
-    /// context (literals/seqs/rep) around the call.
+    /// own buffer. The coverage indexing is outlined
+    /// ([`Self::insert_covered_fast`]): with it inline, the whole helper
+    /// grew past the inliner's budget, and every scan-loop call site paid a
+    /// full spill/reload of the emit context (literals/seqs/rep) around the
+    /// call.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn emit(
@@ -812,19 +883,7 @@ impl TableEmit<'_> {
             self.literals,
             self.seqs,
         );
-        insert_covered(
-            win,
-            self.table,
-            None,
-            self.win_base,
-            start,
-            match_len,
-            self.insert_max,
-            self.hash_log,
-            self.covered_fill,
-            ChainHashWidth::Five,
-            0,
-        );
+        self.insert_covered_fast(win, start, match_len);
         self.win_base + match_end as u64
     }
 
@@ -857,7 +916,7 @@ impl TableEmit<'_> {
         insert_covered(
             win,
             self.table,
-            Some(links),
+            links,
             self.win_base,
             start,
             match_len,
