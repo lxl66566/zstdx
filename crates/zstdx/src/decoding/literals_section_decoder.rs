@@ -115,14 +115,12 @@ pub(crate) fn prepare_section_table(
 ) -> Result<u32, DecompressLiteralsError> {
     match ls_type {
         LiteralsSectionType::Compressed => {
-            // read Huffman tree description
-            let bytes_read = scratch.table.build_decoder(source)?;
+            // read Huffman tree description, building only the decode table
+            // this section will decode through: the X2 path skips the X1
+            // materialization (`build_decoder_selected`)
+            let use_x2 = select_x2_table(regenerated_size, source.len());
+            let bytes_read = scratch.table.build_decoder_selected(source, use_x2)?;
 
-            // pick the decoding table shape for this block's literals,
-            // mirroring libzstd's HUF_selectDecoder cost model
-            if select_x2_table(regenerated_size, source.len()) {
-                scratch.table.build_x2_table();
-            }
             vprintln!("Built huffman table using {bytes_read} bytes");
             Ok(bytes_read)
         },
@@ -285,7 +283,9 @@ fn decompress_literals(
             // (and libzstd's op/olimit + endOfDStream checks). A stream that
             // encodes past its quarter would shift every later segment's
             // output position, so it is corruption even when the totals
-            // still add up.
+            // still add up. Decodes through `HuffmanDecoder`, so an X2-built
+            // table needs its single-symbol table re-derived.
+            scratch.table.materialize_x1_table();
             let tl = scratch.table.max_num_bits as isize;
             let mut seg_start = 0;
             for (&(start, end), &seg_end) in stream_bounds.iter().zip(seg_end.iter()) {
@@ -324,8 +324,10 @@ fn decompress_literals(
 
         bytes_read += source.len() as u32;
     } else {
-        // just decode the one stream
+        // just decode the one stream: through `HuffmanDecoder`, so an
+        // X2-built table needs its single-symbol table re-derived
         assert_eq!(num_streams, 1);
+        scratch.table.materialize_x1_table();
         let mut decoder = HuffmanDecoder::new(&scratch.table);
         let mut br = BitReaderReversed::new(source);
         if !br.skip_padding_marker() {

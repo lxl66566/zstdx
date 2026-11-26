@@ -139,15 +139,15 @@ impl HuffmanTable {
     }
 
     /// Completely empty the table then repopulate as a replica
-    /// of `other`. `bit_ranks` stays empty: it is fill scratch rebuilt at the
-    /// top of every table fill from `bits` (`build_table_from_weights`),
-    /// never read between fills.
+    /// of `other`. `bit_ranks` rides along with `bits` so the lazy X1
+    /// materialization of an X2-built table stays correct on a clone.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
         self.packed.extend_from_slice(&other.packed);
         self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
         self.bits.extend_from_slice(&other.bits);
+        self.bit_ranks.extend_from_slice(&other.bit_ranks);
         self.x2.extend_from_slice(&other.x2);
         self.fse_table.reinit_from(&other.fse_table);
     }
@@ -171,7 +171,46 @@ impl HuffmanTable {
 
         let bytes_used = self.read_weights(source)?;
         self.build_table_from_weights()?;
+        self.fill_decode_tables();
         Ok(bytes_used)
+    }
+
+    /// Read the tree description and build only the decode table the section
+    /// will decode through: the double-symbol X2 table when `use_x2` selects
+    /// it and the weight set pairs well enough for it, otherwise the
+    /// single-symbol X1 table. The X2 path skips the X1 materialization,
+    /// mirroring `HUF_readDTableX2_wksp`, which builds the double-symbol
+    /// table straight off the weights; the decode paths that read the X1
+    /// table re-derive it lazily through `materialize_x1_table`.
+    ///
+    /// Returns the number of bytes read.
+    pub(crate) fn build_decoder_selected(
+        &mut self,
+        source: &[u8],
+        use_x2: bool,
+    ) -> Result<u32, HuffmanTableError> {
+        self.packed.clear();
+
+        let bytes_used = self.read_weights(source)?;
+        self.build_table_from_weights()?;
+        if use_x2 {
+            self.build_x2_table();
+        }
+        // A weight set the X2 pairing threshold rejects falls back to the
+        // single-symbol table, so the table actually present decides.
+        if self.x2.is_empty() {
+            self.fill_decode_tables();
+        }
+        Ok(bytes_used)
+    }
+
+    /// Build the single-symbol X1 table when it is missing, as an X2
+    /// build leaves it empty. Idempotent: an already-materialized table
+    /// is left untouched.
+    pub(crate) fn materialize_x1_table(&mut self) {
+        if self.packed.is_empty() {
+            self.fill_decode_tables();
+        }
     }
 
     /// The decode table packed as u16 entries: `(symbol << 8) | num_bits`.
@@ -337,7 +376,9 @@ impl HuffmanTable {
     /// Once the weights have been read from the data, you can decode the weights
     /// into a table, and use that table to decode the actual compressed data.
     ///
-    /// This function populates the rest of the table from the series of weights.
+    /// This fills `bits`, `max_num_bits` and the `bit_ranks` rank counts the
+    /// table fills build on; the decode tables themselves are the caller's
+    /// to materialize (`build_decoder`, `build_decoder_selected`).
     fn build_table_from_weights(&mut self) -> Result<(), HuffmanTableError> {
         use HuffmanTableError as err;
 
@@ -414,8 +455,6 @@ impl HuffmanTable {
         for num_bits in &self.bits {
             self.bit_ranks[(*num_bits) as usize] += 1;
         }
-
-        self.fill_decode_tables();
 
         Ok(())
     }
@@ -511,8 +550,10 @@ impl HuffmanTable {
     /// bits the entries of that slice are upgraded to decode two symbols per
     /// lookup (level 2), consuming the summed bit count.
     ///
-    /// Must be called after `build_table_from_weights`; the regular single-symbol
-    /// table is still used by the finish loop and the single-stream path.
+    /// Must be called after `build_table_from_weights`: the rank statistics
+    /// come off the `bit_ranks` that call filled. A weight set the pairing
+    /// threshold rejects clears the X2 table, and the caller falls back to
+    /// the single-symbol table.
     pub(crate) fn build_x2_table(&mut self) {
         /// X2 entries are indexed by the top 11 bits of the bit window.
         const TARGET_LOG: i32 = 11;
@@ -521,18 +562,19 @@ impl HuffmanTable {
         debug_assert!((1..=11).contains(&tl));
         let nb_bits_baseline = tl + 1;
 
-        // rank_stats[w] = number of symbols with huffman weight w (1..=tl);
-        // self.bits[] holds per-symbol code lengths incl. the inferred last
-        // symbol, weight = nb_bits_baseline - code_length.
+        // rank_stats[w] = number of symbols with huffman weight w (1..=tl),
+        // read off `bit_ranks` without a pass over bits: bit_ranks[n] counts
+        // the code length n incl. the inferred last symbol, and a weight-w
+        // symbol has code length nb_bits_baseline - w.
         let mut rank_stats = [0u32; 13];
         let mut max_w = 0usize;
-        for &b in &self.bits {
-            if b == 0 {
-                continue;
+        for n in 1..=tl as usize {
+            let count = self.bit_ranks[n];
+            if count > 0 {
+                let w = nb_bits_baseline as usize - n;
+                rank_stats[w] = count;
+                max_w = max_w.max(w);
             }
-            let w = (nb_bits_baseline - b as i32) as usize;
-            rank_stats[w] += 1;
-            max_w = max_w.max(w);
         }
 
         let min_bits = nb_bits_baseline - max_w as i32; // shortest code length
@@ -545,14 +587,12 @@ impl HuffmanTable {
         // single-symbol entries (2x wider than X1 entries, u16 writes with a
         // garbage second byte, variable output advance) make X2 slower than
         // the plain single-symbol loop despite the halved chain for the rest.
+        // The sum runs over the weight classes instead of a second pass over
+        // bits: one symbol contributes 2^(w + rescale) slots.
         let mut eligible_slots = 0u32;
-        for &b in &self.bits {
-            if b == 0 {
-                continue;
-            }
-            let w = nb_bits_baseline - b as i32;
-            if TARGET_LOG - (nb_bits_baseline - w) >= min_bits {
-                eligible_slots += 1u32 << (w + rescale) as u32;
+        for w in 1..=max_w {
+            if TARGET_LOG - (nb_bits_baseline - w as i32) >= min_bits {
+                eligible_slots += rank_stats[w] << (w as i32 + rescale) as u32;
             }
         }
         if eligible_slots * 5 < 4u32 << TARGET_LOG {
@@ -560,21 +600,25 @@ impl HuffmanTable {
             return;
         }
 
-        // sort symbols by weight: starts[w]..ends[w] is the weight-w range
+        // sort symbols by weight: starts[w]..ends[w] is the weight-w range.
+        // bits.len() caps at 256 (at most 255 written weights plus the
+        // inferred last symbol), so the sort lives on the stack instead of a
+        // per-build heap vec.
         let mut starts = [0u32; 14];
         let mut next = 0u32;
         for w in 1..=max_w {
             starts[w] = next;
             next += rank_stats[w];
         }
-        let mut sorted = vec![0u8; next as usize];
+        let mut sorted = [0u8; 256];
+        let sorted_fill = &mut sorted[..next as usize];
         let mut ends = starts;
         for (sym, &b) in self.bits.iter().enumerate() {
             if b == 0 {
                 continue;
             }
             let w = (nb_bits_baseline - b as i32) as usize;
-            sorted[ends[w] as usize] = sym as u8;
+            sorted_fill[ends[w] as usize] = sym as u8;
             ends[w] += 1;
         }
 
@@ -599,6 +643,161 @@ impl HuffmanTable {
 
         self.x2.clear();
         self.x2.resize(1 << TARGET_LOG, 0);
+        let sorted_all = &sorted[..next as usize];
+
+        // Fill through a raw cursor over the 2^11 window, the reference's own
+        // shape: every span lands inside the window because the rank spans
+        // sum to the table size by the Kraft equality asserted above, and the
+        // span fills pair their stores per two entries.
+        // SAFETY: `dt` points at the 2^11-entry table just sized; every
+        // `dt.add(start + off)` base stays below it because each weight
+        // class's runs tile its own 2^11 span (rank_val0 construction).
+        let dt = self.x2.as_mut_ptr();
+        unsafe {
+            for w in 1..=max_w {
+                let nb_bits = nb_bits_baseline - w as i32;
+                let begin = starts[w] as usize;
+                let end = ends[w] as usize;
+                if begin == end {
+                    continue;
+                }
+                if TARGET_LOG - nb_bits >= min_bits {
+                    // Enough room after the code for at least the shortest
+                    // second code: upgrade every entry of the span to
+                    // two-symbol entries.
+                    let length = 1usize << (TARGET_LOG - nb_bits);
+                    let min_weight = (nb_bits + scale_log).max(1) as usize;
+                    let rv = &rank_val[nb_bits as usize];
+                    // The span width, continuation offset and packed bit
+                    // fields of a second code depend only on the class pair
+                    // (w, w2), so they are derived once per class pair.
+                    let mut span2 = [0usize; 13];
+                    let mut off2 = [0usize; 13];
+                    let mut head2 = [0u32; 13];
+                    for w2 in min_weight..=max_w {
+                        let total_bits = nb_bits_baseline - w2 as i32 + nb_bits;
+                        span2[w2] = 1usize << (TARGET_LOG - total_bits);
+                        off2[w2] = rv[w2] as usize;
+                        head2[w2] = ((total_bits as u32) << 16) | (2 << 24);
+                    }
+                    // continuations whose remaining bits are too few for any
+                    // second code keep decoding a single symbol
+                    let skip = off2[min_weight];
+                    let single_head = ((nb_bits as u32) << 16) | (1 << 24);
+                    let mut start = rank_val0[w] as usize;
+                    for s in begin..end {
+                        let seq = sorted_all[s] as u32;
+                        let p = dt.add(start);
+                        for i in 0..skip {
+                            p.add(i).write_unaligned(seq | single_head);
+                        }
+                        for w2 in min_weight..=max_w {
+                            let span = span2[w2];
+                            let head = head2[w2];
+                            let mut base = start + off2[w2];
+                            let mut sec = starts[w2] as usize;
+                            let sec_end = ends[w2] as usize;
+                            while sec < sec_end {
+                                let double = seq | ((sorted_all[sec] as u32) << 8) | head;
+                                fill_x2_span(dt.add(base), span, double);
+                                base += span;
+                                sec += 1;
+                            }
+                        }
+                        start += length;
+                    }
+                } else {
+                    // no room for a second symbol: single-symbol entries
+                    let span = 1usize << (TARGET_LOG - nb_bits);
+                    let single_head = ((nb_bits as u32) << 16) | (1 << 24);
+                    let mut start = rank_val0[w] as usize;
+                    for s in begin..end {
+                        let entry = (sorted_all[s] as u32) | single_head;
+                        fill_x2_span(dt.add(start), span, entry);
+                        start += span;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The per-symbol-pair fill this table used before the class-hoisted form,
+    /// kept as the equivalence reference for `build_x2_table`: it re-derives
+    /// every slice bound and packed field per symbol pair, so the fast fill
+    /// may never drift from the semantics it defines.
+    #[cfg(test)]
+    fn build_x2_table_reference(&mut self) {
+        /// X2 entries are indexed by the top 11 bits of the bit window.
+        const TARGET_LOG: i32 = 11;
+
+        let tl = self.max_num_bits as i32;
+        debug_assert!((1..=11).contains(&tl));
+        let nb_bits_baseline = tl + 1;
+
+        let mut rank_stats = [0u32; 13];
+        let mut max_w = 0usize;
+        for &b in &self.bits {
+            if b == 0 {
+                continue;
+            }
+            let w = (nb_bits_baseline - b as i32) as usize;
+            rank_stats[w] += 1;
+            max_w = max_w.max(w);
+        }
+
+        let min_bits = nb_bits_baseline - max_w as i32; // shortest code length
+        let scale_log = nb_bits_baseline - TARGET_LOG; // ≤ 0
+        let rescale = TARGET_LOG - tl - 1;
+
+        let mut eligible_slots = 0u32;
+        for &b in &self.bits {
+            if b == 0 {
+                continue;
+            }
+            let w = nb_bits_baseline - b as i32;
+            if TARGET_LOG - (nb_bits_baseline - w) >= min_bits {
+                eligible_slots += 1u32 << (w + rescale) as u32;
+            }
+        }
+        if eligible_slots * 5 < 4u32 << TARGET_LOG {
+            self.x2.clear();
+            return;
+        }
+
+        let mut starts = [0u32; 14];
+        let mut next = 0u32;
+        for w in 1..=max_w {
+            starts[w] = next;
+            next += rank_stats[w];
+        }
+        let mut sorted = vec![0u8; next as usize];
+        let mut ends = starts;
+        for (sym, &b) in self.bits.iter().enumerate() {
+            if b == 0 {
+                continue;
+            }
+            let w = (nb_bits_baseline - b as i32) as usize;
+            sorted[ends[w] as usize] = sym as u8;
+            ends[w] += 1;
+        }
+
+        let mut rank_val0 = [0u32; 13];
+        let mut acc = 0u32;
+        for w in 1..=max_w {
+            rank_val0[w] = acc;
+            acc += rank_stats[w] << (w as i32 + rescale) as u32;
+        }
+        debug_assert_eq!(acc, 1 << TARGET_LOG);
+
+        let mut rank_val = [[0u32; 13]; 12];
+        for consumed in min_bits..=(TARGET_LOG - min_bits) {
+            for w in 1..=max_w {
+                rank_val[consumed as usize][w] = rank_val0[w] >> consumed;
+            }
+        }
+
+        self.x2.clear();
+        self.x2.resize(1 << TARGET_LOG, 0);
         let dt = &mut self.x2;
 
         let pack =
@@ -609,16 +808,12 @@ impl HuffmanTable {
             let begin = starts[w] as usize;
             let end = ends[w] as usize;
             if TARGET_LOG - nb_bits >= min_bits {
-                // Enough room after the code for at least the shortest second
-                // code: upgrade every entry of the span to two-symbol entries.
                 let length = 1usize << (TARGET_LOG - nb_bits);
                 let min_weight = (nb_bits + scale_log).max(1) as usize;
                 let rv = &rank_val[nb_bits as usize];
                 let mut start = rank_val0[w] as usize;
                 for s in begin..end {
                     let base_seq = sorted[s];
-                    // continuations whose remaining bits are too few for any
-                    // second code keep decoding a single symbol
                     let skip = rv[min_weight] as usize;
                     dt[start..start + skip].fill(pack(base_seq as u32, nb_bits as u32, 1));
                     for w2 in min_weight..=max_w {
@@ -638,7 +833,6 @@ impl HuffmanTable {
                     start += length;
                 }
             } else {
-                // no room for a second symbol: single-symbol entries
                 let span = 1usize << (TARGET_LOG - nb_bits);
                 let mut start = rank_val0[w] as usize;
                 for &sym in &sorted[begin..end] {
@@ -659,6 +853,47 @@ impl HuffmanTable {
 impl Default for HuffmanTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Fill `span` consecutive X2 entries with `entry`, the reference fill's own
+/// shape (`HUF_fillDTableX2ForWeight`): spans are powers of two, every even
+/// span rides one unaligned 64-bit store per entry pair, and wide spans
+/// double a seeded prefix instead of walking per entry.
+///
+/// # Safety
+/// The caller must guarantee `[p, p + span)` stays inside the table.
+#[inline(always)]
+unsafe fn fill_x2_span(p: *mut u32, span: usize, entry: u32) {
+    let pair = (u64::from(entry) << 32) | u64::from(entry);
+    unsafe {
+        match span {
+            1 => p.write_unaligned(entry),
+            2 => p.cast::<u64>().write_unaligned(pair),
+            4 => {
+                p.cast::<u64>().write_unaligned(pair);
+                p.add(2).cast::<u64>().write_unaligned(pair);
+            },
+            8 => {
+                p.cast::<u64>().write_unaligned(pair);
+                p.add(2).cast::<u64>().write_unaligned(pair);
+                p.add(4).cast::<u64>().write_unaligned(pair);
+                p.add(6).cast::<u64>().write_unaligned(pair);
+            },
+            _ => {
+                // wide spans: seed eight entries, then double the filled prefix
+                let seeded = 8.min(span);
+                for i in 0..seeded {
+                    p.add(i).write_unaligned(entry);
+                }
+                let mut filled = seeded;
+                while filled < span {
+                    let copy = filled.min(span - filled);
+                    p.copy_to_nonoverlapping(p.add(filled), copy);
+                    filled += copy;
+                }
+            },
+        }
     }
 }
 
@@ -772,6 +1007,139 @@ mod tests {
             weights.swap(i, j);
         }
         Some(weights)
+    }
+
+    /// The class-hoisted X2 fill and the per-symbol-pair reference must
+    /// produce identical `x2` tables for every valid weight distribution:
+    /// the double-symbol table is a pure function of the weights, and the
+    /// hoisted fill may never drift from the pair-by-pair semantics the
+    /// reference defines.
+    #[test]
+    fn x2_fill_matches_reference() {
+        let mut state = 0x0fed_cba9_8765_4321u64;
+        let mut sets: Vec<Vec<u8>> = vec![vec![1], vec![1, 1, 1, 1]];
+        for mb in 1..=7u32 {
+            sets.push(vec![1; (1 << mb) - 1]);
+        }
+        let mut trials = 0;
+        while trials < 400 {
+            let tail = rng_next(&mut state) % 4 < 2;
+            if let Some(weights) = gen_weight_set(&mut state, tail) {
+                sets.push(weights);
+                trials += 1;
+            }
+        }
+        let mut eligible = 0;
+        for (n, weights) in sets.iter().enumerate() {
+            // raw 4-bit descriptions cap at 128 weights; FSE-encode the wide
+            // ones and every sixteenth set to cover both weights-header paths
+            let src = if weights.len() <= 128 && (n % 16 != 0 || weights.len() < 4) {
+                raw_table(weights)
+            } else {
+                fse_table(weights)
+            };
+            let mut fast = HuffmanTable::new();
+            assert_eq!(fast.build_decoder(&src).unwrap() as usize, src.len());
+            fast.build_x2_table();
+            let mut reference = HuffmanTable::new();
+            reference.build_decoder(&src).unwrap();
+            reference.build_x2_table_reference();
+            assert_eq!(fast.x2, reference.x2, "x2 mismatch for {weights:?}");
+            eligible += usize::from(!fast.x2.is_empty());
+        }
+        // the sweep must exercise the fill itself, not only the empty-table gate
+        assert!(
+            eligible > 300,
+            "only {eligible} eligible sets built a table"
+        );
+    }
+
+    /// The selected build must yield the same tables the full build produces:
+    /// an X2-selected description skips the X1 materialization, so `x2` must
+    /// be bit-identical to the two-table build's, `packed` must stay empty
+    /// while the X2 table is present, and the lazy materialization must
+    /// re-derive the exact `packed` the full build wrote. Pairing-rejected
+    /// and X1-armed descriptions must materialize the single-symbol table
+    /// right away, and a clone of an X2-built table must still be able to.
+    #[test]
+    fn selected_build_matches_full_build() {
+        let mut state = 0x1357_9bdf_2468_ace0u64;
+        let mut sets: Vec<Vec<u8>> = vec![vec![1], vec![1, 1, 1, 1]];
+        for mb in 1..=7u32 {
+            sets.push(vec![1; (1 << mb) - 1]);
+        }
+        let mut trials = 0;
+        while trials < 400 {
+            let tail = rng_next(&mut state) % 4 < 2;
+            if let Some(weights) = gen_weight_set(&mut state, tail) {
+                sets.push(weights);
+                trials += 1;
+            }
+        }
+        for (n, weights) in sets.iter().enumerate() {
+            let src = if weights.len() <= 128 && (n % 16 != 0 || weights.len() < 4) {
+                raw_table(weights)
+            } else {
+                fse_table(weights)
+            };
+            let mut full = HuffmanTable::new();
+            assert_eq!(full.build_decoder(&src).unwrap() as usize, src.len());
+            full.build_x2_table();
+
+            let mut selected = HuffmanTable::new();
+            assert_eq!(
+                selected.build_decoder_selected(&src, true).unwrap() as usize,
+                src.len()
+            );
+            assert_eq!(selected.x2, full.x2, "x2 mismatch for {weights:?}");
+
+            // the clone of an X2-built table carries the rank counts, so its
+            // lazy materialization stays correct without a rebuild
+            let mut clone = HuffmanTable::new();
+            clone.reinit_from(&selected);
+
+            if selected.x2.is_empty() {
+                // pairing rejected: the single-symbol table is already there
+                assert_eq!(
+                    selected.packed, full.packed,
+                    "packed mismatch for {weights:?}"
+                );
+            } else {
+                assert!(
+                    selected.packed.is_empty(),
+                    "X2 build kept the X1 table for {weights:?}"
+                );
+                selected.materialize_x1_table();
+                assert_eq!(
+                    selected.packed, full.packed,
+                    "materialized packed mismatch for {weights:?}"
+                );
+                // idempotent on an already-materialized table
+                selected.materialize_x1_table();
+                assert_eq!(selected.packed, full.packed);
+            }
+
+            if clone.x2.is_empty() {
+                assert_eq!(clone.packed, full.packed, "clone mismatch for {weights:?}");
+            } else {
+                clone.materialize_x1_table();
+                assert_eq!(
+                    clone.packed, full.packed,
+                    "clone materialized packed mismatch for {weights:?}"
+                );
+            }
+
+            let mut x1_armed = HuffmanTable::new();
+            assert_eq!(
+                x1_armed.build_decoder_selected(&src, false).unwrap() as usize,
+                src.len()
+            );
+            assert!(x1_armed.x2.is_empty());
+            assert_eq!(
+                x1_armed.packed, full.packed,
+                "packed mismatch for {weights:?}"
+            );
+        }
     }
 
     /// The rank-grouped fill and the scatter reference must produce identical

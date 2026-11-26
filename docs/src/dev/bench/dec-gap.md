@@ -90,6 +90,100 @@ The copy loops hold the largest single executor lump, 18.4% of the executor's sa
 - The stream cells read x1.01 to 1.05 on json and text, where the bulk cells win. The difference is the streaming pair's drain copy, which both sides pay.
 - Text's long matches run the 16-byte copy loop at about 10 bytes per cycle, the per-core L3 bandwidth for its 2.3 MiB window. A trace replay of its 151 tile copies of about 112 KB each found no faster kernel: libzstd's 2x16 schedule read -3.5% copy-only, and AVX2, AVX-512, libc memcpy and non-temporal stores all lost.
 
+## The textreal decode band
+
+The real axis where decode reads a lead: textreal x0.88 to 0.99 against libzstd, both paths, from the 2026-11-25 release pass. The 2026-11-26 R123 decomposition put callgrind Ir on both sides of the full 33.6 MB frames at zst1/zst3/zst9 through a throwaway two-implementation driver — the same reused-decoder bulk shape and 64 KiB-pull streaming shape the matrix cells time, ours and the reference through the same buffer protocol — reading each cell at one and three iterations and taking per-function 3-minus-1 diffs so the fixed input cost drops out. The band reproduced on the base tree at bulk x0.977/0.890/0.888 and stream x0.985/0.907/0.907.
+
+The census first, because both sides must pay the same wire work before the split means anything: 834/786/996 entropy-coded blocks at zst1/zst3/zst9, every block carrying a fresh Huffman description, 831/738/36 X2-mode and 3/48/957 X1-mode literals sections, and three explicit sequence-table descriptions per block (2,502/2,358/2,988) with no Repeat-mode stream. The reference reads the same description bytes on the same layout.
+
+Per-decode Ir, ours against libzstd, with the component splits read off the same diffs:
+
+| component | zst1 | zst3 | zst9 |
+|---|---:|---:|---:|
+| sequence executor | 124.0M vs 132.9M | 207.8M vs 225.2M | 186.8M vs 202.8M |
+| X2 literal loop | 40.5M vs 38.0M | 11.8M vs 11.1M | — |
+| X1 literal loop | — | — | 9.0M vs 7.7M |
+| sequence FSE chain | 7.9M vs 5.4M | 7.3M vs 5.2M | 8.4M vs 5.9M |
+| Huffman rebuild chain | 7.3M vs 3.2M | 7.0M vs 2.8M | 4.0M vs 2.1M |
+| whole decode | 195.5M vs 196.6M | 249.8M vs 261.8M | 224.1M vs 236.0M |
+
+The premise inverted: whole-frame Ir sits 4 to 5 percent below the reference at zst3/zst9 (parity at zst1), so the x0.89 band is cycle- and memory-side, and the executor's port win carries it. The literal loops sit at their recorded parities (the X2 asm stretch, the X1 cycle limit), and the two our-side excesses are both per-block setup. The sequence FSE chain reads 3.2/3.1/2.8K Ir per table against the reference's 2.15/2.2/2.0K — the two-pass form the 2026-11-18 fold landed re-priced on textreal's wider table logs, where dll100 read 1.1x and textreal reads 1.4x. The Huffman rebuild chain reads 8.7/8.9/4.0K per literals section against 3.8/3.7/2.1K, because every compressed-literals section pays the full X1 `build_decoder` fill — 4.1K per section at zst3 — before `build_x2_table` converts it, where `HUF_readDTableX2_wksp` builds the double-symbol table straight off the weights and rank counts. The weights-FSE decode loop inside the chain prices about 0.15 percent of the frame in outlining candidates and stays.
+
+The X2 fill diet (2026-11-26, R123) took the chain's largest dietable share. `build_x2_table` read 50.8K Ir per build against `HUF_readDTableX2_wksp`'s 18.4K, the excess being per-symbol-pair slice bounds, iterator machinery and a per-build heap sort vector. The fill now derives its rank statistics off the `bit_ranks` the X1 fill already counts, keeps the sorted symbols in a stack array, hoists the span width, continuation offset and packed bit fields once per (rank, rank) pair, and writes through a raw cursor in the reference's own span-switched shape — 1/2/4/8 paired stores as unaligned 64-bit writes with the doubling copy `HUF_fillDTableX2` uses. A per-symbol-pair reference stays in the source behind `cfg(test)`, and an equivalence test builds both ways over 409 weight distributions. The fill reads 37.8K per build, and the full frames read −0.69/−0.48/−0.02 percent Ir at zst1/zst3/zst9 bulk (−0.59/−0.41/−0.02 stream).
+
+Gungraun against the pre-change baseline credits text −0.687/−0.350/−0.192 percent Ir at l1/l3/l9, dll l1 −0.262 with l3 and l9 exactly flat, own_fastest and own_balanced text −0.512/−0.400, skewed −0.03 to −0.09, and json +0.05 to +0.28 percent on cells the X2 path never touches (codegen drift, sub-gate). The locked interleaved wall A/B — position-balanced driver rounds, the base tree at 3b649be2 — moved textreal.zst1 bulk +1.68 percent and zst3 bulk +0.47/+0.49 percent across two independent runs, jsonreal +0.47 to +0.66 percent on both paths, with textreal.zst9 flat, the stream cells flat inside the ±0.8 percent noise band, and the text, json and skewed controls flat within ±1 percent. The locked matrix moved every textreal cell: bulk x0.977 to 0.975, 0.890 to 0.895, 0.888 to 0.897 and stream 0.985 to 0.982, 0.907 to 0.910, 0.907 to 0.912, with every control inside its recorded band.
+
+The X2-direct build (2026-11-26, R126) closed the chain's structural excess. `prepare_section_table` builds only the table the section decodes through, through `HuffmanTable::build_decoder_selected`: an X2-selected description builds the double-symbol table alone, skipping the X1 materialization exactly as `HUF_readDTableX2_wksp` does, and a pairing-rejected or X1-armed description builds the single-symbol table alone. The decode paths that read the X1 table regardless of the selection — the slow 4-stream fallback and the single-stream path, both through `HuffmanDecoder` — re-derive it lazily through `materialize_x1_table`, an idempotent rank fill over the retained `bits` and `bit_ranks`; on textreal every section passes the interleaved fast gate, so the lazy path never runs there. `reinit_from` copies `bit_ranks` so a pooled clone of an X2-built table can still materialize, and `build_decoder` keeps its two-table contract for the dictionary loader and the huff0 round-trips. The per-decode chain reads 7.28M to 3.87M at zst1 and 6.70M to 3.56M at zst3, both −47 percent, with the whole frame −1.50/−1.05/−0.24 percent Ir at zst1/zst3/zst9 bulk; the zst9 control stays near flat because 957 of its 996 sections are X1. Gungraun against the pre-change baseline credits text −0.861/−0.421/−0.235 percent Ir at l1/l3/l9, json −0.19 to −0.31, dll −0.03, skewed −0.02 to −0.07, with every non-text control inside 0.38 percent. The locked interleaved wall A/B moved textreal.zst1 bulk +1.28 percent and zst3 bulk +0.84 percent, and every X2-bearing control improved — text.zst3 stream +2.59, json.zst3 bulk +1.76, jsonreal bulk +1.19 — with the X2-poor cells flat inside overlapping noise bands and no cell regressed. The locked matrix moved every textreal cell again: bulk x0.975 to 0.956, x0.895 to 0.870 and x0.897 to 0.877 at zst1/zst3/zst9, stream x0.982 to 0.977, x0.910 to 0.900 and x0.912 to 0.906, and jsonreal.zst3 bulk crossed to x0.997, with the core controls inside their recorded bands.
+
+The band stays open as a cycle-side lead with one named Ir excess, tracked as todo 44: the widened two-pass FSE residue, 1.4x per table on textreal's wide table logs where dll100 reads 1.1x.
+
+## The jsonreal decode band
+
+The real axis where decode trails: jsonreal reads x1.01 to 1.05 bulk and 1.03 to 1.08 stream against libzstd on every cell and pull, the widest unattributed decode deficit on record, while textreal reads ahead at x0.88 to 0.99, [matrix](matrix.md) and [snapshot](snapshot.md). The 2026-11-26 R127 decomposition prices it with the textreal band's method, at jsonreal.zst1, zst3 and zst9, with textreal measured as the contrast through the same driver.
+
+The harness is a throwaway two-implementation driver: the reused-decoder bulk shape (`FrameDecoder::decode_all` into one reused output slice against `zstd::bulk::decompress_to_buffer`), the 64 KiB-pull streaming shape, each cell at one and three iterations under callgrind with per-function 3-minus-1 diffs so the fixed input cost drops out, plus `perf stat` over cycles, instructions, branch misses and cache misses at forty bulk and twenty-five stream iterations and `perf record` lumps on the same cells at 20 kHz pinned to one core. The driver takes the raw output length from its caller, so no calibration decode of either implementation lands inside a measured process. It reproduces the matrix cells, which verify the checksum on both sides: jsonreal x1.04/1.01/1.01 bulk and 1.05/1.02/1.03 stream against the recorded 1.05/1.01/1.02 and 1.07/1.03/1.04, textreal x0.97/0.88/0.89 and 0.97/0.90/0.91 against 0.977/0.870/0.877 and 0.985/0.900/0.906.
+
+The census first, because both sides must pay the same wire work before the split means anything. Every jsonreal frame is per-block unique work: not one sequence description and not one Huffman tree description repeats inside a frame at any level, so the keyed table cache's whole ceiling on this axis is the weights-FSE table, whose repeats run 15 to 34 percent and price at about 0.3 to 0.5 percent of the frame's instructions. The Huffman population splits 43/240 X1/X2 at zst1, 114/156 at zst3 and 297/57 at zst9, off the same cost model the reference runs.
+
+| frame | blocks | sequence descriptions (LL/OF/ML) | seq repeats | Huffman rebuilds (X1/X2) | Huffman repeats | weights-FSE rebuilds (repeats) |
+|---|---:|---:|---:|---:|---:|---:|
+| jsonreal.zst1 | 284 | 284/284/284 | 0 (0.0%) | 283 (43/240) | 0 (0.0%) | 283 (96, 33.9%) |
+| jsonreal.zst3 | 271 | 271/271/271 | 0 (0.0%) | 270 (114/156) | 0 (0.0%) | 270 (66, 24.4%) |
+| jsonreal.zst9 | 379 | 322/290/175 | 0 (0.0%) | 354 (297/57) | 0 (0.0%) | 354 (52, 14.7%) |
+| textreal.zst1 | 278 | 278/278/278 | 0 (0.0%) | 278 (1/277) | 0 (0.0%) | 278 (169, 60.8%) |
+| textreal.zst3 | 262 | 262/262/262 | 0 (0.0%) | 262 (17/245) | 0 (0.0%) | 262 (134, 51.1%) |
+| textreal.zst9 | 343 | 342/311/309 | 0 (0.0%) | 332 (321/11) | 0 (0.0%) | 332 (70, 21.1%) |
+
+The description counts below the block count at zst9 are the streams that carry no explicit description: 57 blocks of jsonreal.zst9 hold no sequence section, and the OF and ML streams of the rest fall to RLE or predefined modes at the deep levels.
+
+The instruction split per decode, ours against libzstd, with the components read off the same diffs:
+
+| component | jsonreal zst1 | jsonreal zst3 | jsonreal zst9 |
+|---|---|---|---|
+| sequence executor | 115.3M vs 122.5M | 121.2M vs 128.8M | 106.8M vs 112.9M |
+| X2 literal loop | 19.1M vs 17.6M | 8.2M vs 7.5M | 2.4M vs 2.3M |
+| X1 literal loop | 1.9M vs 1.6M | 5.0M vs 4.3M | 8.5M vs 7.3M |
+| sequence FSE chain | 13.6M vs 9.6M | 13.4M vs 9.5M | 10.6M vs 7.4M |
+| Huffman rebuild chain | 12.6M vs 5.2M | 9.8M vs 4.3M | 9.3M vs 4.2M |
+| FSE description parse | 4.3M vs 1.5M | 4.1M vs 1.4M | 3.8M vs 1.4M |
+| checksum | 23.1M vs 32.5M | 23.1M vs 32.5M | 23.1M vs 32.5M |
+| whole decode | 192.4M vs 190.9M (x1.008) | 186.7M vs 188.6M (x0.990) | 165.8M vs 168.3M (x0.985) |
+
+The checksum row is not a like-for-like column: ours is its own symbol where the reference's sits inlined in its frame loop, so its number is the reference's no-checksum frame delta, 0.97 Ir/B against our 0.69 over the same 33.55 MB of output. The premise inverts as it did on textreal: whole-frame Ir sits at parity or below the reference in bulk, so no instruction lever closes a bulk cell. The stream cells read +4.4 to +5.2 percent for the mirror reason: the same +14.1M of rebuild chains against the checksum's -9.6M, the executor's +3.0M of wrapped-generation copies that the reference's one-shot loop never pays, and 2.7M more drain memcpy instructions over the same sinks, 41.5M against 38.8M.
+
+Per-decode cycles, `perf stat` medians over five interleaved draws with the checksum on, in the x notation:
+
+| cell | bulk cycles | bulk instructions | bulk branch misses | stream cycles | stream instructions | stream branch misses |
+|---|---|---|---|---|---|---|
+| jsonreal.zst1 | 1.042 | 0.997 | 1.158 | 1.051 | 1.047 | 1.132 |
+| jsonreal.zst3 | 1.014 | 0.981 | 1.120 | 1.022 | 1.042 | 1.075 |
+| jsonreal.zst9 | 1.013 | 0.980 | 1.178 | 1.032 | 1.044 | 1.115 |
+| textreal.zst1 | 0.966 | 0.980 | 1.184 | 0.975 | 1.029 | 1.145 |
+| textreal.zst3 | 0.882 | 0.945 | 1.085 | 0.899 | 1.013 | 0.931 |
+| textreal.zst9 | 0.892 | 0.944 | 1.071 | 0.908 | 1.017 | 0.917 |
+
+The band is cycle-side, +1 to +5 percent, and the branch-miss column is the one ratio the two shapes share, +7 to +18 percent on every checksummed cell. Cache misses run the other way, 0.84 to 1.00 of the reference's, so no memory-side residue exists either.
+
+The checksum is no part of it, priced by running checksum-free frames of the same content through both sides: the absorb costs 8.5M cycles against the reference's 8.7M at zst1 bulk, 8.2 to 8.9M against 7.6 to 9.1M across the six cells, 0.24 to 0.26 cycles per byte on both sides, with our loop carrying 23.1M instructions against the reference's 32.5M.
+
+The cycle shares on jsonreal.zst1 bulk put the split on one component: the sequence executor reads 59.2 percent against the reference's 65.3 (36.5M cycles against 38.6M), the literal loops 10.9 against 11.4 (6.70M against 6.71M), the three entropy rebuild chains 14.5 against 8.3 (8.95M against 4.90M), and the checksum with its frame loop 14.5 against 14.2 (8.9M against 8.4M). The chains' +4.1M cycles exceed the +2.5M band, and the executor's -2.1M is what masks it down to the recorded x1.04. Per build, from the census's rebuild counts:
+
+| rebuild | jsonreal zst1 | ratio | jsonreal zst3 | ratio | jsonreal zst9 | ratio |
+|---|---|---|---|---|---|---|
+| sequence FSE build | 15.9K vs 11.3K | 1.41x | 16.3K vs 11.6K | 1.40x | 13.3K vs 9.4K | 1.42x |
+| X2 Huffman fill | 28.9K vs 13.0K | 2.23x | 25.4K vs 12.6K | 2.01x | 23.3K vs 11.8K | 1.97x |
+| X1 Huffman fill | 6.6K vs 4.2K | 1.59x | 7.2K vs 4.2K | 1.70x | 6.3K vs 4.2K | 1.49x |
+| weights-FSE decode | 7.9K vs 3.7K | 2.15x | 7.8K vs 3.7K | 2.12x | 7.2K vs 3.5K | 2.05x |
+| FSE description parse | 3.8K vs 1.1K | 3.51x | 3.8K vs 1.1K | 3.51x | 3.4K vs 0.9K | 3.62x |
+
+The sequence FSE build's 1.41x is todo 44's named residue, the two-pass form the 2026-11-18 fold landed, now priced on a second real shape at the ratio textreal records; the X2 fill's 2.0 to 2.2x is the R123 diet's remainder; the weights-FSE decode and the NCount reader are the same class of Rust-body volume against compact C loops. None of the five is wire-unique work, so the R107 census class does not describe this band.
+
+The copy lumps next, because the corpus residue sat in them. The flat executor's own trace, over the `seq_dump` hook, prices jsonreal's copies as lighter than textreal's at every level: 856K sequences averaging 35.6 match bytes and 3.5 literals in 2.29M 16-byte chunk trips at 13.3 B per trip at zst1, against textreal's 2.00M sequences at 10.6 match bytes and 6.2 literals in 2.21M trips at 9.5 B per trip. The sub-16 offset class, the 8-byte `overlap_copy8` path, is 0.14 percent of jsonreal's match bytes against 0.7 percent of textreal's, and its literals are 9 percent of its output against textreal's 37, which locates the two shapes' executor difference in the work between the copies rather than in the copy kernels the record already falsifies as a family, [negative](../negative/decoding.md). The executor's instruction count agrees: 134.7 Ir per sequence against the reference's 143.1 on jsonreal, and 124.3 against 133.1 on textreal.
+
+What the split leaves is the shape difference, and it is arithmetic on the cycle totals rather than a second mechanism. The per-frame setup is the same absolute cost on both shapes, the three rebuild chains at 8.7M cycles on textreal against 8.95M on jsonreal and the checksum at 8.4M on both, while jsonreal's reference-side frame costs 42 percent fewer cycles, 59.1M against 101.8M at zst1 bulk. The chains' excess, +4.1M cycles on jsonreal and +3.2M on textreal, is therefore 6.9 percent of the former's frame against 3.1 percent of the latter's, which is why one reads x1.01 to 1.05 and the other x0.88 to 0.99 on the same absolute excess.
+
+The band closes as a floor attribution rather than a lever row. Its one named component is the per-block entropy rebuild machinery, +4.1M cycles and +14.1M instructions on jsonreal.zst1, and every one of its five rebuild rates lands in a residue class the record already carries: todo 44's two-pass FSE build at 1.41x, the R123 X2 fill's remainder at 2.0 to 2.2x, and the description-parse and weights-FSE readers at 3.5x and 2.1x, all passes the reference also runs rather than wire work. The avenues the probe's recipe named are closed by its own numbers: the keyed table cache's reopen condition counts zero repeated sequence and Huffman descriptions in every jsonreal frame, the copy-kernel family is falsified and the executor already reads below the reference, and the checksum prices at parity on both sides. The reopening condition is the one todo 44 names, a build-side diet landing those five rates inside the record's per-build bands without reopening the falsified single-pass fusion, the R124 dispatch classes or the entropy-side closures, [negative](../negative/decoding.md).
+
 ## The per-block entropy table census
 
 The table machinery prices at about 5.5 percent of the dll100 decode wall, and one dll100.zst3 decode pays about 3.9K sequence-table and 1.2K X1 Huffman rebuilds, so a per-decoder cache of built tables keyed on the description bytes looked like it could cut repeated work. A throwaway build instrumented every rebuild site of the one-shot single-threaded path, hashed the description bytes each rebuild consumed together with the table kind and its accuracy log or table log, and counted per frame how many rebuilds receive a description byte-identical to an earlier one of the same kind. The share is 3 percent of the sequence rebuilds and 0.4 percent of the Huffman rebuilds: the descriptions are per-block unique work, and the cache's whole ceiling is 0.20 percent of the frame's instructions, about 0.1 percent of its wall.
