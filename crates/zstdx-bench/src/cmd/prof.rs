@@ -5,11 +5,15 @@
 //! - `prof dec <file.zst> [iters=5]`: streaming decode with 64 KiB reads.
 //! - `prof enc <zstd-level> <iters> <file...>`: bulk encode; `RUZ_CKSUM` in the environment
 //!   switches to the checksummed bulk path.
-//! - `prof enc-stream <zstd-level> <iters> <file> [workers=1]`: streaming encode with 64 KiB
-//!   writes; a worker count above one selects the mt streaming core.
-//! - `prof enc-stream-read <zstd-level> <iters> <file> [workers=1]`: the read-shaped streaming
-//!   encoder over an in-memory source with 64 KiB output pulls — the exact shape the matrix
-//!   `enc-stream` cells time (checksums off).
+//! - `prof enc-stream <zstd-level> <iters> <file> [workers=1] [flags]`: streaming encode with 64
+//!   KiB writes; a worker count above one selects the mt streaming core. The optional flags
+//!   (comma-separated, fifth rest arg) carry `pledged`, declaring the source's length as the
+//!   frame's pledge (the armed-class stream cells).
+//! - `prof enc-stream-read <zstd-level> <iters> <file> [workers=1] [flags]`: the read-shaped
+//!   streaming encoder over an in-memory source with 64 KiB output pulls — the exact shape the
+//!   matrix `enc-stream` cells time (checksums off). The optional flags (comma-separated, fifth
+//!   rest arg) are `owned` — the zero-copy in-memory feed (`read::OwnedEncoder`) — and `pledged`,
+//!   which declares the source's length as the frame's pledge (the armed-class stream cells).
 
 use std::{
     fs,
@@ -122,15 +126,23 @@ fn run_enc_stream(rest: &[String]) {
         .get(3)
         .map_or(1, |w| w.parse().expect("workers must be a number"));
     let raw = fs::read(path).unwrap();
+    // The optional fifth rest arg is a comma-separated flag list;
+    // `pledged` declares the source's length as the frame's pledge.
+    let pledged = rest
+        .get(4)
+        .is_some_and(|f| f.split(',').any(|flag| flag == "pledged"));
     let mut sink = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     let t0 = Instant::now();
     for _ in 0..iters {
-        let mut enc = zstdx::stream::write::Encoder::with_options(
-            Vec::new(),
-            zstdx::EncoderOptions::new(level).workers(workers),
-        )
-        .unwrap();
+        let opts = if pledged {
+            zstdx::EncoderOptions::new(level)
+                .workers(workers)
+                .pledged_size(Some(raw.len() as u64))
+        } else {
+            zstdx::EncoderOptions::new(level).workers(workers)
+        };
+        let mut enc = zstdx::stream::write::Encoder::with_options(Vec::new(), opts).unwrap();
         let mut off = 0usize;
         loop {
             let n = chunk.len().min(raw.len() - off);
@@ -145,7 +157,12 @@ fn run_enc_stream(rest: &[String]) {
     }
     let dt = t0.elapsed().as_secs_f64();
     println!(
-        "{path} L{level:?} w{workers}: {iters} iters, out={} bytes, {:.0} MiB/s",
+        "{path} L{level:?} w{workers}{}: {iters} iters, out={} bytes, {:.0} MiB/s",
+        if pledged {
+            " pledged"
+        } else {
+            ""
+        },
         sink.len(),
         iters as f64 * raw.len() as f64 / dt / (1 << 20) as f64
     );
@@ -158,16 +175,25 @@ fn run_enc_stream_read(rest: &[String]) {
     let workers: u32 = rest
         .get(3)
         .map_or(1, |w| w.parse().expect("workers must be a number"));
-    // `owned` as the fifth rest arg swaps the Read pump for the zero-copy
-    // in-memory feed (`read::OwnedEncoder`); the loop shape is unchanged.
-    let owned = rest.get(4).is_some_and(|w| w == "owned");
+    // The optional fifth rest arg is a comma-separated flag list: `owned`
+    // swaps the Read pump for the zero-copy in-memory feed
+    // (`read::OwnedEncoder`), `pledged` declares the source's length as
+    // the frame's pledge; the loop shape is unchanged.
+    let flags = rest.get(4).map_or(String::new(), |w| w.clone());
+    let owned = flags.split(',').any(|f| f == "owned");
+    let pledged = flags.split(',').any(|f| f == "pledged");
     let raw = fs::read(path).unwrap();
     let mut sink = vec![0u8; 64 * 1024];
     // Built fresh per round: the entries take the options by value.
     let options = || {
-        zstdx::EncoderOptions::new(level)
+        let opts = zstdx::EncoderOptions::new(level)
             .checksum(false)
-            .workers(workers)
+            .workers(workers);
+        if pledged {
+            opts.pledged_size(Some(raw.len() as u64))
+        } else {
+            opts
+        }
     };
     // The owned feed's source moves in and out of the encoder each round
     // (finish reclaims it); its one materialization sits outside timing.
@@ -209,9 +235,14 @@ fn run_enc_stream_read(rest: &[String]) {
     }
     let dt = t0.elapsed().as_secs_f64();
     println!(
-        "{path} L{level:?} w{workers}{}: {iters} iters, out={total_out} bytes, {:.0} MiB/s",
+        "{path} L{level:?} w{workers}{}{}: {iters} iters, out={total_out} bytes, {:.0} MiB/s",
         if owned {
             " owned"
+        } else {
+            ""
+        },
+        if pledged {
+            " pledged"
         } else {
             ""
         },

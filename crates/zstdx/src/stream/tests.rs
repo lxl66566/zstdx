@@ -1719,6 +1719,194 @@ mod mt {
         }
     }
 
+    /// A pledged keep-class frame whose clamped window reaches the
+    /// full-window band (at `LDM_FULL_WINDOW` and beyond) runs the bulk
+    /// windowed model on the stream side too: the pinned capture grid,
+    /// window-wide strips and the stream-side publisher's snapshot chain
+    /// (see `LdmChain`) — the recorded gap stood the stream on the stock
+    /// worker-scaled grid with per-job LDM restarts instead (dll100 l9:
+    /// +12 to +17 percent over bulk; dll400: +19). The pinned grid is
+    /// worker-independent, so 2/4/8 workers must agree with bulk and each
+    /// other byte for byte, and the write cadence must not move the bytes
+    /// either (fine chunks park the publisher's walk between posts, coarse
+    /// ones walk it whole).
+    #[test]
+    fn pledged_windowed_capture_matches_bulk() {
+        let _mem = heavy_mem(HeavyMem::Mid);
+        let unit_len = 8 * 1024 * 1024;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        let mut patterns = Vec::with_capacity(96);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..96 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            patterns.push(state.to_le_bytes());
+        }
+        let mut head = Vec::with_capacity(head_len);
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < head_len {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        unit[..head_len].copy_from_slice(&head);
+        unit[1024 * 1024..1024 * 1024 + head_len].copy_from_slice(&head);
+        // 34 MiB: past the mid-size band's 32 MiB edge, so the
+        // source-clamped window reaches 64 MiB — the full-window band.
+        let tail_len = unit_len / 4;
+        let mut data = Vec::with_capacity(4 * unit_len + tail_len);
+        for copy in 0..5u32 {
+            let up = if copy < 4 {
+                unit_len
+            } else {
+                tail_len
+            };
+            for i in 0..up {
+                data.push(if i % 4096 == (copy as usize * 1024) % 4096 {
+                    unit[i] ^ 0x5a
+                } else {
+                    unit[i]
+                });
+            }
+        }
+        // The far class must ride the capture on both entries: the
+        // frames sit well below the chain-only parse.
+        let st = encoding::compress_slice_to_vec(&data, Level::Balanced);
+        let bulk_at = |workers: u32| {
+            encoding::mt::compress_slice_mt(
+                &data,
+                Level::Balanced,
+                true,
+                workers,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            )
+        };
+        let w8 = bulk_at(8);
+        assert!(
+            w8.len() <= st.len() + st.len() / 50,
+            "the far class must ride the capture: mt {} vs st {}",
+            w8.len(),
+            st.len()
+        );
+        for workers in [2u32, 4, 8] {
+            let bulk_mt = bulk_at(workers);
+            assert_eq!(bulk_mt, w8, "the pinned capture grid is worker-independent");
+            let streamed = encode_write(
+                &data,
+                1024 * 1024,
+                Level::Balanced,
+                workers,
+                true,
+                Some(data.len() as u64),
+            );
+            assert_eq!(streamed, w8, "workers {workers}");
+            let fine = encode_write(
+                &data,
+                64 * 1024,
+                Level::Balanced,
+                workers,
+                true,
+                Some(data.len() as u64),
+            );
+            assert_eq!(fine, w8, "chunk cadence at {workers} workers");
+        }
+        // Both decoders roundtrip the frame.
+        let back = bulk::decompress_with(&w8, 0, &crate::DecoderOptions::new()).unwrap();
+        assert_eq!(back, data);
+        let mut reference = Vec::new();
+        zstd::stream::copy_decode(w8.as_slice(), &mut reference).unwrap();
+        assert_eq!(reference, data);
+    }
+
+    /// The windowed band's mid-stream stream adopters — jobs starting
+    /// past the window, whose strip views are non-zero-based while the
+    /// publisher's snapshots are absolute — must shift the adopted
+    /// snapshot into view coordinates exactly (see
+    /// `LdmState::restore_shifted`): an unshifted restore re-anchors the
+    /// remainder fill at the wrong bytes, the divergence the port's first
+    /// field probe read at 80 MiB, where the last job's window base sat
+    /// at offset 6 MiB. 148 MiB grids ten 16 MiB jobs over the W26
+    /// window (the bulk twin `mt_windowed_midstream_adoption_is_timing_free`
+    /// runs the same lattice): jobs 8-9 start at 128/144 MiB with window
+    /// bases 64/80 MiB, past the first publish — the mid-stream adopter
+    /// class the shift serves — and the fine-cadence rounds park the
+    /// publisher's walk between posts.
+    #[test]
+    fn stream_windowed_midstream_adoption_matches_bulk() {
+        let _mem = heavy_mem(HeavyMem::CapScale);
+        const MIB: usize = 1024 * 1024;
+        let unit_len = 5 * MIB;
+        let mut unit = lcg(unit_len);
+        let head_len = 256 * 1024;
+        let mut patterns = Vec::with_capacity(96);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..96 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            patterns.push(state.to_le_bytes());
+        }
+        let mut head = Vec::with_capacity(head_len);
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < head_len {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        unit[..head_len].copy_from_slice(&head);
+        unit[MIB..MIB + head_len].copy_from_slice(&head);
+        let total = 148 * MIB;
+        let mut data = Vec::with_capacity(total);
+        for copy in 0.. {
+            if data.len() >= total {
+                break;
+            }
+            let take = unit.len().min(total - data.len());
+            let flip = (copy as usize * 1024) % 4096;
+            for (i, &b) in unit[..take].iter().enumerate() {
+                data.push(if i % 4096 == flip {
+                    b ^ 0x5a
+                } else {
+                    b
+                });
+            }
+        }
+        let bulk16 = encoding::mt::compress_slice_mt(
+            &data,
+            Level::Balanced,
+            true,
+            16,
+            None,
+            None,
+            None,
+            crate::LdmMode::Auto,
+        );
+        for workers in [4u32, 8, 16] {
+            let streamed = encode_write(
+                &data,
+                2 * MIB,
+                Level::Balanced,
+                workers,
+                true,
+                Some(data.len() as u64),
+            );
+            assert_eq!(streamed, bulk16, "workers {workers}");
+            let fine = encode_write(
+                &data,
+                64 * 1024,
+                Level::Balanced,
+                workers,
+                true,
+                Some(data.len() as u64),
+            );
+            assert_eq!(fine, bulk16, "fine cadence at {workers} workers");
+        }
+        let back = bulk::decompress_with(&bulk16, 0, &crate::DecoderOptions::new()).unwrap();
+        assert_eq!(back, data);
+        let mut reference = Vec::new();
+        zstd::stream::copy_decode(bulk16.as_slice(), &mut reference).unwrap();
+        assert_eq!(reference, data);
+    }
+
     /// An absurd pledge on a fast row must not stall `write` behind a
     /// pledge-proportional schedule walk: the first staged band resolves
     /// the capture schedule in window-bounded time, the writes return,

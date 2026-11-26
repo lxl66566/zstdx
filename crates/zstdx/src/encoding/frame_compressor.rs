@@ -960,6 +960,7 @@ pub(crate) fn compress_job_blocks(
         Vec::new(),
         overlap,
         JobSpf::None,
+        0,
     )
 }
 
@@ -998,6 +999,10 @@ pub(crate) enum JobSpf<'a> {
 /// chain's reach tail into the dense tables).
 // Job-level entry: the distinct per-job knobs stay flat arguments (a
 // bundling struct would just mirror them one-to-one at every call site).
+// `origin` is the absolute position of `src`'s index 0 — the bulk frames
+// hand absolutely-indexed prefixes and pass 0, the pledged stream's
+// strip-based views pass their strip base (the windowed adoption's
+// coordinate shift, see `windowed_ldm_prefill`).
 #[cfg(feature = "std")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_job_blocks_inner(
@@ -1010,6 +1015,7 @@ pub(crate) fn compress_job_blocks_inner(
     prefix: Vec<u8>,
     chain_overlap: usize,
     spf: JobSpf<'_>,
+    origin: u64,
 ) -> Vec<u8> {
     let block_size = state.matcher.block_size();
     let max_window = state.matcher.window_size() as usize;
@@ -1058,6 +1064,7 @@ pub(crate) fn compress_job_blocks_inner(
                     ldm_base,
                     job.start as u64,
                     snap,
+                    origin,
                 );
             }
         },

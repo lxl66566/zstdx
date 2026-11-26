@@ -690,6 +690,7 @@ pub fn compress_slice_mt(
                                 prefix,
                                 job_overlap,
                                 JobSpf::None,
+                                0,
                             );
                             return_pooled_slice_state(dstate);
                             return out;
@@ -1736,6 +1737,7 @@ fn capture_head_parses(
 
 /// The capture lattice's engagement band for one frame (see
 /// `capture_band`): the window's class, which picks the schedule.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CaptureBand {
     /// The chain rows' clamped row window inside
     /// `[LDM_MIDSIZE_WINDOW, LDM_FULL_WINDOW)`: every job's window strip
@@ -1754,7 +1756,7 @@ pub(crate) enum CaptureBand {
 
 impl CaptureBand {
     /// The capture window the band runs at.
-    fn window(&self) -> u64 {
+    pub(crate) fn window(&self) -> u64 {
         match self {
             Self::MidSize { window } | Self::Windowed { window } | Self::Fast { window } => *window,
         }
@@ -1867,6 +1869,24 @@ fn prefix_last_job(n_jobs: u64, job_size: u64, window: u64) -> Option<u64> {
     // The empty scan (n_jobs <= 1) has no candidate; the clamp below can
     // otherwise floor a single-job frame onto the out-of-range index 0.
     (n_jobs > 1 && last >= 1).then(|| last.min(n_jobs - 1))
+}
+
+/// The windowed band's plan constants (see `plan_prefix_ldm`): the median
+/// boundary (the first publish target, balancing the sequential build
+/// against the adopters' parallel remainder fills), the last adopter's
+/// start (the build's fill target) and the publish cadence. Shared by the
+/// bulk plan and the pledged stream's publisher (see `encoder_mt`) so the
+/// two run the same publish lattice and their frames agree byte for byte.
+pub(crate) fn windowed_plan_constants(
+    n_jobs: u64,
+    job_size: u64,
+    window: u64,
+) -> Option<(u64, u64, u64)> {
+    let last = prefix_last_job(n_jobs, job_size, window)?;
+    let med = (last / 2 + 1) * job_size;
+    let stop = (n_jobs - 1) * job_size;
+    let cadence = ((stop - med) / 12).max(SPF_SEG);
+    Some((med, stop, cadence))
 }
 
 /// The capture grid's job size when the frame's class engages the shared
@@ -1993,13 +2013,7 @@ fn plan_prefix_ldm(
         return Some(PrefixPlan::SelfFill { med });
     }
     if let CaptureBand::Windowed { .. } = band {
-        // The last adopting job's start: the build needs to reach it (its
-        // own remainder fill then covers the rest), and no further.
-        let stop = ((n_jobs - 1) * job_size) as u64;
-        // At most ~13 publishes span med..stop, so the unpruned snapshot
-        // list stays bounded while every adopter can find an entry at or
-        // below its start.
-        let cadence = ((stop - med) / 12).max(SPF_SEG);
+        let (med, stop, cadence) = windowed_plan_constants(n_jobs as u64, job_size as u64, window)?;
         Some(PrefixPlan::Windowed(WindowPlan {
             med,
             stop,
@@ -2242,7 +2256,10 @@ pub(crate) fn prepare_job_state(
 /// window agree). `ldm` is the job's LDM arming context; `spf` the shared
 /// prefix fill's engagement (see [`JobSpf`]) — the windowed band prefill
 /// indexes only the chain's reach tail while the job's window (`overlap`)
-/// spans the whole LDM history.
+/// spans the whole LDM history. `origin` is the absolute position of
+/// `src`'s index 0 (0 for the bulk frames' absolutely-indexed views, the
+/// strip base for the stream's strip views; see
+/// `windowed_ldm_prefill`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_job_with(
     state: &mut CompressState<MatchGeneratorDriver>,
@@ -2258,6 +2275,7 @@ pub(crate) fn run_job_with(
     ldm_mode: crate::LdmMode,
     bal_head: &[u8],
     bt_domain: BtDomain,
+    origin: u64,
 ) -> Vec<u8> {
     #[cfg(feature = "job_trace")]
     let trace_reset = std::time::Instant::now();
@@ -2292,6 +2310,7 @@ pub(crate) fn run_job_with(
         Vec::new(),
         chain_overlap,
         spf,
+        origin,
     )
 }
 
@@ -2328,6 +2347,7 @@ pub(crate) fn run_job(
         ldm_mode,
         bal_head,
         bt_domain,
+        0,
     );
     return_pooled_slice_state(state);
     output

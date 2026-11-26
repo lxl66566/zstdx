@@ -673,6 +673,41 @@ impl LdmState {
     }
 
     #[cfg(feature = "std")]
+    /// Adopt a snapshot shifted into view coordinates (the pledged
+    /// stream's windowed-band adopter, see `windowed_ldm_prefill`): the
+    /// stream's job views are strip-based — src's index 0 is the job's
+    /// strip base — while the publisher's snapshots are absolute, so
+    /// the adopter shifts every stored position by `-origin` on the way
+    /// in. The table is content-hash keyed and the stored positions
+    /// live only in offset differences, so the uniform wrapping shift
+    /// is exact; an entry below the view's base wraps far beyond the
+    /// window reach and dies on the distance filter there — exactly the
+    /// dead band the window would have filtered anyway — while a packed
+    /// `0` (the empty slot, or the bias wrap a dead entry already is)
+    /// stays zero. A below-base snapshot's shifted `fed` is negative and
+    /// saturates to zero; `fill`'s `fed < base` rearm then derives the
+    /// rolling hash from the bytes exactly like the unshifted
+    /// below-base rearm.
+    pub(super) fn restore_shifted(&mut self, snap: &LdmSnapshot, origin: u64) {
+        debug_assert_eq!(self.table.len(), snap.table.len());
+        self.table.clone_from(&snap.table);
+        let shift = origin as u32;
+        if shift != 0 {
+            for slot in self.table.iter_mut() {
+                if *slot as u32 != 0 {
+                    *slot = (*slot & 0xffff_ffff_0000_0000)
+                        | ((*slot as u32).wrapping_sub(shift)) as u64;
+                }
+            }
+        }
+        self.bucket_offsets.clone_from(&snap.bucket_offsets);
+        self.rolling = snap.rolling;
+        self.fed = snap.fed.saturating_sub(origin);
+        self.arm = snap.arm.saturating_sub(origin);
+        self.stale = false;
+    }
+
+    #[cfg(feature = "std")]
     /// Absolute position up to which the rolling hash has been fed (the
     /// resume point of a continuation fill).
     pub(super) fn fed(&self) -> u64 {
@@ -965,6 +1000,47 @@ impl LdmState {
             }
             #[cfg(debug_assertions)]
             batch_poison::assert(&splits, count, "ldm fill_to_freeze batch");
+            pos += n as u64;
+            if count == BATCH_SIZE && pos >= soft {
+                return Some(pos);
+            }
+        }
+        None
+    }
+
+    /// [`Self::fill_to_freeze`]'s scan without the inserts: the windowed
+    /// chain publisher probes for the next freeze before running the
+    /// inserted fill — the split set is position-pure (see
+    /// [`Self::fill_parallel`]), so the freeze the probe finds is the one
+    /// the inserted fill lands on, while a probe whose data runs short
+    /// leaves the state untouched (nothing consumed, no rewind needed).
+    /// A probe reads the state exactly where it sits — at a freeze point,
+    /// the one boundary kind a fill resumes exactly — and never advances
+    /// it.
+    pub(super) fn probe_freeze(
+        &self,
+        win: &[u8],
+        win_base: u64,
+        base: u64,
+        end: u64,
+        soft: u64,
+    ) -> Option<u64> {
+        debug_assert_eq!(self.fed, base);
+        let floor = self.arm.max(win_base);
+        let mut splits = [0u64; BATCH_SIZE];
+        let mut hash = self.rolling;
+        let mut pos = base;
+        while pos < end {
+            let (n, count) = gear_scan(
+                win,
+                win_base,
+                pos,
+                end,
+                floor,
+                self.stop_mask,
+                &mut hash,
+                &mut splits,
+            );
             pos += n as u64;
             if count == BATCH_SIZE && pos >= soft {
                 return Some(pos);

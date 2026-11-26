@@ -2722,7 +2722,13 @@ impl MatchGeneratorDriver {
     /// adopter only hands covering snapshots here; a snapshot older than
     /// `ldm_base` re-arms there with the byte-derived rolling state,
     /// though its bucket phase stays `upto`-dependent, see
-    /// [`LdmPrefixSnapshot`]).
+    /// [`LdmPrefixSnapshot`]). `origin` is the absolute position of
+    /// `ldm_win`'s index 0: the bulk frames pass 0 (absolute indexing),
+    /// while the pledged stream's strip-based job views pass their
+    /// strip base, so the adoption shifts the snapshot's positions into
+    /// view coordinates (see [`LdmState::restore_shifted`]) — the
+    /// snapshot-free arm ignores it (a cold restart is
+    /// coordinate-frame-free).
     #[cfg(feature = "std")]
     pub(crate) fn windowed_ldm_prefill(
         &mut self,
@@ -2730,6 +2736,7 @@ impl MatchGeneratorDriver {
         ldm_base: u64,
         job_start: u64,
         snap: Option<&LdmPrefixSnapshot>,
+        origin: u64,
     ) {
         debug_assert_eq!(ldm_base + ldm_win.len() as u64, job_start);
         let Some(ldm) = self.ldm.as_mut() else {
@@ -2740,7 +2747,8 @@ impl MatchGeneratorDriver {
         self.ldm_dead = false;
         self.ldm_canary = 0;
         match snap {
-            Some(s) => ldm.restore(&s.ldm),
+            Some(s) if origin == 0 => ldm.restore(&s.ldm),
+            Some(s) => ldm.restore_shifted(&s.ldm, origin),
             None => ldm.restart(ldm_base),
         }
         #[cfg(feature = "job_trace")]
@@ -2835,6 +2843,28 @@ impl MatchGeneratorDriver {
         LdmPrefixSnapshot {
             ldm: ldm.snapshot(),
             upto,
+        }
+    }
+
+    /// The windowed chain publisher's freeze probe (see
+    /// [`LdmChain`]): the same scan [`Self::ldm_fill_segment`] runs,
+    /// without the inserts, so the walk can see the next freeze before
+    /// committing a fill and leave the state untouched when the buffered
+    /// data runs short of it.
+    #[cfg(feature = "std")]
+    pub(crate) fn ldm_probe_freeze(
+        &self,
+        data: &[u8],
+        base: u64,
+        from: u64,
+        soft: u64,
+    ) -> Option<u64> {
+        let ldm = self.ldm.as_ref()?;
+        debug_assert_eq!(ldm.fed(), base + from);
+        if data.len() as u64 > from {
+            ldm.probe_freeze(data, base, base + from, base + data.len() as u64, soft)
+        } else {
+            None
         }
     }
 

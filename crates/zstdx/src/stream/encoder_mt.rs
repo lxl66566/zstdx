@@ -99,9 +99,9 @@
 //! verdicts are content-pure). Sanctioned divergences from the bulk
 //! modes: an open-ended stream has no length to band-check, so `Enable`
 //! declares the unclamped raised window before any content exists (the
-//! ST unpledged entry's own shape), and the chain rows' whole-window
-//! strip schedule keeps its pre-existing bulk divergence on the
-//! full-window band.
+//! ST unpledged entry's own shape), and the unpledged stream keeps its
+//! pre-existing divergence on the full-window band (the pledged frames
+//! below port it; the open-ended ones keep the stock grid).
 
 use alloc::{sync::Arc, vec::Vec};
 use core::{
@@ -139,14 +139,14 @@ use crate::{
         ldm::LdmSeq,
         match_generator::{
             BT_DOMAIN_DENSE_SPAN, BtDomain, LDM_FULL_WINDOW, LDM_MIDSIZE_WINDOW, LdmArming,
-            MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot, bt_domain_class,
-            far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
+            LdmPrefixSnapshot, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
+            bt_domain_class, far_repeat_dominant, fast_row_screen_pending, ldm_head_parses,
         },
         mt::{
             CAPTURE_JOB_CAP, CaptureBand, MIN_JOB_SIZE, SerialLdmFeed, btlazy_job_size,
             capture_band, capture_job_size, deep_ldm_band, donate_keep_span, fast_capture_schedule,
             head_predicts_keep, job_size_for, job_size_for_level, opt_ldm_feed_band,
-            prepare_job_state, run_job_with,
+            prepare_job_state, run_job_with, windowed_plan_constants,
         },
         reach_probe::{self, ProbeFeedback, ReachChoice},
     },
@@ -390,6 +390,10 @@ enum JobSpfStream {
     /// [`JobSpf::Windowed`] with no snapshot: `windowed_ldm_prefill`
     /// fills `[start - window, start)` from zero.
     Windowed,
+    /// [`JobSpf::Windowed`] with the windowed capture band's pinned
+    /// publish (see [`LdmChain`]): the first snapshot covering the job's
+    /// window base, adopted at post time so the worker never waits.
+    WindowedSnap(Arc<LdmPrefixSnapshot>),
     /// The serial LDM feed's published span for this job (the opt rows'
     /// far class, see [`MtEncoderCore::resolve_opt_feed`]): computed on
     /// the posting thread at post time, so the worker consumes it
@@ -404,31 +408,30 @@ impl Clone for JobSpfStream {
             Self::None => Self::None,
             Self::Whole(snap) => Self::Whole(snap.clone()),
             Self::Windowed => Self::Windowed,
+            Self::WindowedSnap(snap) => Self::WindowedSnap(snap.clone()),
             Self::Feed(seqs, window) => Self::Feed(seqs.clone(), *window),
         }
     }
 }
 
-/// The pledged mid-size capture's engagement (see
+/// The pledged chain-row capture's engagement (see
 /// [`MtEncoderCore::engage_midsize_capture`]): the canonical capture
 /// predicate (`mt::capture_band` — the same classes the bulk dispatch
-/// runs, so the paths cannot drift) filtered to the mid-size band the
-/// stream core ports, plus the declared length the engagement needs (the
-/// pledge keys the fixed grid the capture re-grids). Shared verbatim by
-/// the capture flip and the donation's arming (see `post_donation`) —
+/// runs, so the paths cannot drift) filtered to the two chain-row bands
+/// the stream core ports, plus the declared length the engagement needs
+/// (the pledge keys the fixed grid the capture re-grids). Shared verbatim
+/// by the capture flip and the donation's arming (see `post_donation`) —
 /// the capture's jobs and a donated job zero must arm alike, and both
 /// sites read the same decision off the same head bytes (nothing posts
 /// or wraps before the verdict resolves, so the buffer's head is still
-/// the frame's). The band filter keeps the stream at the mid-size class:
-/// the full-window band runs windowed jobs on the bulk side (chain
-/// tables over the reach tail, LDM through the shared build's snapshot
-/// ring) while the stream core keeps its whole-window strip schedule
-/// there — a pledged W26 stream grids its stock 64 MiB jobs with LDM
-/// armed at the `Job` bar (the window equals it), carrying the far class
-/// already; the two paths' bytes diverge on that band either way (the
-/// pre-existing divergence, recorded in dev/perf/mt-stream). The fast
-/// rows never reach here (`capture_band` resolves their window only via
-/// `fast_window`, which this call never carries): their both-bands
+/// the frame's). Both bands re-grid the same way (pinned
+/// `capture_job_size`, window-wide overlap, [`LdmArming::JobPrefix`]);
+/// the mid-size band runs whole-prefix strips with no build (every job's
+/// window strip is a frame prefix), while the full-window band runs the
+/// bulk windowed model — chain tables over the reach tail, LDM through
+/// the stream-side publisher's snapshot chain (see [`LdmChain``]). The
+/// fast rows never reach here (`capture_band` resolves their window only
+/// via `fast_window`, which this call never carries): their both-bands
 /// capture is [`FastCapture`], which ports the R22 no-build schedule.
 /// The engagement deliberately stops at the window decision: the bulk
 /// grid's prefix-tail gate (`prefix_last_job` inside `capture_grid`)
@@ -436,17 +439,65 @@ impl Clone for JobSpfStream {
 /// `capture_job_size` directly, and the one-job W25 edge where the two
 /// disagree keeps the pre-existing pledged-vs-bulk divergence (recorded
 /// above), not a new one.
-fn midsize_capture_window(
+fn chain_capture_band(
     level: Level,
     shape: crate::InputShape,
     head: &[u8],
     ldm_mode: crate::LdmMode,
-) -> Option<u64> {
+) -> Option<CaptureBand> {
     shape.len?;
-    match capture_band(level, shape, ReachChoice::Keep, head, None, ldm_mode) {
-        Some(CaptureBand::MidSize { window }) => Some(window),
+    match capture_band(level, shape, ReachChoice::Keep, head, None, ldm_mode)? {
+        band @ (CaptureBand::MidSize { .. } | CaptureBand::Windowed { .. }) => Some(band),
         _ => None,
     }
+}
+
+/// The windowed capture band's stream-side publisher (the bulk
+/// `build_ldm_prefix_chain` restructured onto the pump): the posting
+/// thread — the one thread that already sees every byte before any job
+/// can — advances one LDM fill over the frame prefix and publishes an
+/// [`LdmPrefixSnapshot`] at every cadence crossing, walking the bulk
+/// build's own segment lattice (`ldm_fill_segment` from each freeze,
+/// `soft = upto + SPF_SEG`, the scan extent `stop + SPF_SEG` clamped at
+/// the source), so the publish list is the bulk build's own and the
+/// frame bytes match the bulk path's at every worker count. A segment
+/// whose buffered data runs short of the next freeze parks without
+/// consuming anything: the walk probes for the freeze first (the
+/// table-free scan, see [`MatchGeneratorDriver::ldm_probe_freeze`]) and
+/// only the probe that finds one runs the inserted fill, so the fill
+/// state always sits at a freeze point across parks and the probe's
+/// re-attempt cost is bounded by waiting for the buffer to grow past
+/// the scanned span. Jobs adopt at post time (see
+/// [`MtEncoderCore::chain_snapshot`]) behind a post gate that holds them
+/// until their covering publish exists, so no worker ever waits on the
+/// pump and every pick is a fixed element of the deterministic publish
+/// list.
+struct LdmChain {
+    /// The publisher's fill state, pooled like the spf build's and held
+    /// for the frame's lifetime (the bulk build's own
+    /// `take_slice_state` + reset + `prefill_window(&[], 0)` start).
+    state: alloc::boxed::Box<CompressState<MatchGeneratorDriver>>,
+    /// The plan constants (the bulk `WindowPlan`): the first publish
+    /// target, the fill's end (the last adopter's start) and the publish
+    /// cadence.
+    med: u64,
+    stop: u64,
+    cadence: u64,
+    /// Published snapshots, ascending in `upto` — the deterministic list
+    /// every adopter's pick reads (bulk's `wait_ldm_snapshot`).
+    publishes: Vec<Arc<LdmPrefixSnapshot>>,
+    /// The fill's resume point: the last freeze the walk banked.
+    upto: u64,
+    /// The next publish target (the first is `med`, the bulk build's own).
+    next_pub: u64,
+    /// The walk finished: `upto` reached `stop`, or no freeze lies before
+    /// the bulk build's own scan extent — the terminal `None` both walks
+    /// read, whose adopters take the done fallback below.
+    done: bool,
+    /// The parked probe's `(input extent, scanned span)`: a parked walk
+    /// re-attempts only once the buffer grew by the span it already
+    /// scanned, bounding the parked class's probe rescan work.
+    parked: Option<(u64, u64)>,
 }
 
 /// One posted job: the frozen source view (see the recycling rules in
@@ -509,6 +560,12 @@ enum JobKind {
         /// (skipping the strip prefill — it would clear the very tables
         /// the donation built) and emits the encoded prefix verbatim.
         donation: Mutex<Option<Donation>>,
+        /// The absolute position of `src`'s index 0 (the strip base):
+        /// `first` and every range the worker derives from it are
+        /// view-relative, while the windowed band's adopted snapshots
+        /// are absolute — the windowed adoption shifts by this (see
+        /// `windowed_ldm_prefill`).
+        view_base: u64,
         out: Mutex<Option<Vec<u8>>>,
         /// Set (Release) once `out` holds the job's bytes: the assembling
         /// side polls this instead of taking the mutex per tick.
@@ -876,6 +933,7 @@ fn run_claimed_job(
             donation,
             spf,
             out,
+            view_base,
             ..
         } => {
             // SAFETY: the posting thread keeps the backing bytes stable for
@@ -918,6 +976,7 @@ fn run_claimed_job(
                     don.prefix,
                     *overlap,
                     JobSpf::None,
+                    0,
                 );
                 crate::encoding::mt::return_donation_state(dstate);
                 out
@@ -949,8 +1008,31 @@ fn run_claimed_job(
                             Vec::new(),
                             *overlap,
                             JobSpf::Whole(&snap),
+                            0,
                         )
                     },
+                    // The windowed capture band's adopter: the pinned
+                    // publish (the post gate's covering pick) continues its
+                    // LDM fill from the snapshot's freeze point — the bulk
+                    // `wait_ldm_snapshot` adopter's exact arm.
+                    JobSpfStream::WindowedSnap(snap) => run_job_with(
+                        state,
+                        src,
+                        *first..frozen.end,
+                        *overlap,
+                        *last_frame_block,
+                        job.level,
+                        job.shape,
+                        job.choice,
+                        *ldm,
+                        JobSpf::Windowed(Some(snap.as_ref())),
+                        job.ldm_mode,
+                        // The capture lattices keep the stock chain jobs
+                        // (see `plain_job_balanced_store`).
+                        &[],
+                        job.bt_domain,
+                        *view_base,
+                    ),
                     // The fast rows' engaged capture: the SelfFill split's
                     // above-median arm, `run_job_with`'s `JobSpf::Windowed`
                     // path (chain tables over the reach tail, LDM
@@ -975,6 +1057,7 @@ fn run_claimed_job(
                         // the stream-side re-grid and staging port lands.
                         &[],
                         job.bt_domain,
+                        0,
                     ),
                     // The serial feed's job (the opt rows' far class): the
                     // posted span replaces the driver's own LDM, the
@@ -993,6 +1076,7 @@ fn run_claimed_job(
                         job.ldm_mode,
                         &[],
                         job.bt_domain,
+                        0,
                     ),
                 }
             };
@@ -1164,6 +1248,10 @@ pub(crate) struct MtEncoderCore {
     /// posting thread is the pump, the bulk feed's scope thread
     /// restructured as an incremental pass over the buffered bytes).
     feed: Option<SerialLdmFeed>,
+    /// The windowed capture band's publisher (see [`LdmChain`]): the
+    /// chain rows' full-window band's shared LDM build, advanced on this
+    /// thread ahead of the posts it gates.
+    ldm_chain: Option<LdmChain>,
     /// The fast rows' far-class capture (see [`FastCapture`]): the
     /// pledged fast row's staging state, then its engaged schedule.
     fast_capture: FastCapture,
@@ -1607,6 +1695,7 @@ impl MtEncoderCore {
             deep_ldm: DeepLdm::Pending,
             opt_feed: OptFeed::Pending,
             feed: None,
+            ldm_chain: None,
             burst_jobs: (options.workers as usize).max(2),
             probe_pending,
             // Pledged dictionary frames alone: the open-ended twin keeps
@@ -1974,6 +2063,7 @@ impl MtEncoderCore {
             tail.extend_from_slice(&self.hasher.finish32().to_le_bytes());
         }
         self.push_out_segment(tail);
+        self.retire_ldm_chain();
         self.finished = true;
         #[cfg(feature = "job_trace")]
         {
@@ -1986,6 +2076,19 @@ impl MtEncoderCore {
                 s.pump_read_ns as f64 / 1e6,
                 s.pump_calls
             );
+        }
+    }
+
+    /// Return the windowed chain's publisher state to the pool when the
+    /// core is done with it: the frame's last job long since adopted its
+    /// publish, so only the pooled state is left (the bulk build's own
+    /// return). A panicking thread's state is discarded instead — the
+    /// pool must not carry a poisoned fill back.
+    fn retire_ldm_chain(&mut self) {
+        if let Some(chain) = self.ldm_chain.take()
+            && !std::thread::panicking()
+        {
+            return_pooled_state(chain.state);
         }
     }
 
@@ -2189,7 +2292,7 @@ impl MtEncoderCore {
         // clamped window sits below the `Job` bar) and job zero's bytes
         // would diverge from the undonated schedule.
         let arming = if matches!(self.grid, JobGrid::Fixed(_))
-            && midsize_capture_window(self.level, self.shape, &head, self.ldm_mode).is_some()
+            && chain_capture_band(self.level, self.shape, &head, self.ldm_mode).is_some()
         {
             LdmArming::JobPrefix
         } else {
@@ -2376,17 +2479,22 @@ impl MtEncoderCore {
     }
 
     /// A pledged keep-class frame whose source-clamped window lands in the
-    /// bulk mid-size capture's class (`prefix_ldm_window`) re-grids onto
+    /// bulk chain-row capture's class (`prefix_ldm_window`) re-grids onto
     /// that capture: reach-based job size (the whole-window strip would
-    /// floor the frame at one job and idle the workers), whole-prefix
-    /// strips (the overlap already is the clamped window) and
+    /// floor the frame at one job and idle the workers), whole-window
+    /// strips (the overlap is the clamped window) and
     /// [`LdmArming::JobPrefix`] — the clamped window sits below the `Job`
     /// bar, so without the flip the far class disarms and the pledged
     /// stream pays a chain-only parse where bulk-mt captures it (dll32:
     /// 5,460,884 vs 4,390,255, a 24% gap against the pledged-equals-bulk
-    /// contract). The donated job zero arms with the same predicate (see
-    /// `post_donation`), so the continuation parses as the capture's own
-    /// job zero would.
+    /// contract). Both bands run the bulk schedule for the same frame:
+    /// the mid-size band's whole-prefix strips need no build, while the
+    /// full-window band arms the stream-side publisher ([`LdmChain`]) —
+    /// the bulk `build_ldm_prefix_chain` restructured onto the pump — so
+    /// the above-boundary jobs adopt its snapshots exactly as the bulk
+    /// adopters do. The donated job zero arms with the same predicate
+    /// (see `post_donation`), so the continuation parses as the
+    /// capture's own job zero would.
     fn engage_midsize_capture(&mut self) {
         if !matches!(self.grid, JobGrid::Fixed(_)) {
             return;
@@ -2395,14 +2503,10 @@ impl MtEncoderCore {
         // canonical predicate (the bulk dispatch's own stance): the stock
         // grid and `Job` arming stay.
         let head = &self.input()[..self.input_len().min(MAX_BLOCK_SIZE as usize)];
-        let Some(window) = midsize_capture_window(self.level, self.shape, head, self.ldm_mode)
-        else {
+        let Some(band) = chain_capture_band(self.level, self.shape, head, self.ldm_mode) else {
             return;
         };
-        // The capture's jobs borrow whole frame prefixes as their strips:
-        // the span widens from the stock strip to the clamped window, the
-        // bulk dispatch's own `capture_window` fold of `job_overlap`.
-        self.overlap = window as usize;
+        let window = band.window();
         let reach = MatchGeneratorDriver::strip_for_choice(
             self.level,
             self.shape,
@@ -2414,8 +2518,52 @@ impl MtEncoderCore {
         // same lattice the bulk path runs and the two stay byte-identical
         // at every worker count.
         let n = self.pledged.expect("the capture gate checked the pledge");
-        self.grid = JobGrid::Fixed(capture_job_size(n, reach as usize));
+        let job_size = capture_job_size(n, reach as usize);
+        // The windowed band mirrors the bulk plan whole (the grid gate
+        // included — `windowed_plan_constants` is `capture_grid`'s own
+        // `prefix_last_job` bar): a frame the plan cannot grid keeps the
+        // stock schedule on both paths.
+        let chain = if let CaptureBand::Windowed { .. } = band {
+            match windowed_plan_constants(n.div_ceil(job_size as u64), job_size as u64, window) {
+                Some((med, stop, cadence)) => {
+                    let mut state = take_pooled_state();
+                    // The take reset clears the switch to Auto; re-reset
+                    // with the frame's so the walk fills exactly as the
+                    // bulk build does (its own `take_slice_state` +
+                    // reset pair), then the build's fresh LDM start.
+                    reset_slice_state_mode(
+                        &mut state,
+                        self.level,
+                        self.shape,
+                        ReachChoice::Keep,
+                        LdmArming::JobPrefix,
+                        self.ldm_mode,
+                    );
+                    state.matcher.prefill_window(&[], 0);
+                    Some(LdmChain {
+                        state,
+                        med,
+                        stop,
+                        cadence,
+                        publishes: Vec::new(),
+                        upto: 0,
+                        next_pub: med,
+                        done: false,
+                        parked: None,
+                    })
+                },
+                None => return,
+            }
+        } else {
+            None
+        };
+        // The capture's jobs borrow the window as their strips: the span
+        // widens from the stock strip to the clamped window, the bulk
+        // dispatch's own `capture_window` fold of `job_overlap`.
+        self.overlap = window as usize;
+        self.grid = JobGrid::Fixed(job_size);
         self.job_ldm = LdmArming::JobPrefix;
+        self.ldm_chain = chain;
     }
 
     /// Resolve the fast-row capture's staging verdict (see
@@ -2622,13 +2770,17 @@ impl MtEncoderCore {
     /// the bulk side's — more than one job (a single job already runs
     /// the frame-continuous LDM of a frame start) and no dictionary (its
     /// job zero is the seed job) — plus the stream's own two: the fixed
-    /// grid the constructor cut is the bulk one, and the pledge must fit
-    /// the accumulate buffer's cap, because the feed's window view is
-    /// the buffer itself (a wrapping stream loses the head the bulk gate
-    /// keeps, and which span a wrap keeps is a recycling-timing
-    /// function). The engagement widens `overlap` to the row window (the
-    /// R95 widened adoption) and the jobs' published spans replace the
-    /// per-job LDM restart, so the pledged stream keeps matching the
+    /// grid the constructor cut is the bulk one, and the buffer feeds'
+    /// pledge must fit the accumulate buffer's cap, because their feed
+    /// window view is the buffer itself (a wrapping stream loses the
+    /// head the bulk gate keeps, and which span a wrap keeps is a
+    /// recycling-timing function). An owned source is resident for the
+    /// frame's lifetime by construction — no buffer, no recycle — so
+    /// the cap keys on the feed shape and not the pledge: a
+    /// resident-source frame past the cap arms the feed and walks the
+    /// owned view. The engagement widens `overlap` to the row window
+    /// (the R95 widened adoption) and the jobs' published spans replace
+    /// the per-job LDM restart, so the pledged stream keeps matching the
     /// bulk frame byte for byte on the class.
     fn resolve_opt_feed(&mut self) {
         if !matches!(self.opt_feed, OptFeed::Pending) {
@@ -2638,9 +2790,10 @@ impl MtEncoderCore {
             self.opt_feed = OptFeed::Off;
             return;
         };
-        // The whole stream must stay resident: the decided reserve covers
-        // a pledge at or below the cap with no recycle point left.
-        if n.saturating_add(64 * 1024) > BUF_CAP_MAX as u64 {
+        // The whole stream must stay resident under the buffer feeds: the
+        // decided reserve covers a pledge at or below the cap with no
+        // recycle point left.
+        if self.owned.is_none() && n.saturating_add(64 * 1024) > BUF_CAP_MAX as u64 {
             self.opt_feed = OptFeed::Off;
             return;
         }
@@ -2688,28 +2841,164 @@ impl MtEncoderCore {
     /// Advance the engaged feed over the buffered bytes before any post
     /// reads a span: jobs post only once their bytes are complete, so
     /// the publication always covers the job being posted and a worker
-    /// never waits on the feed.
-    fn advance_feed(&mut self) {
+    /// never waits on the feed. `upto` is the input extent the caller
+    /// needs published — the covering chunk of the job being posted
+    /// (`feed_cover`), or the whole buffered extent at a tail — so a
+    /// resident-source frame generates one job's worth at a time instead
+    /// of the whole input at the first post.
+    fn advance_feed(&mut self, upto: u64) {
         if self.feed.is_none() {
             return;
         }
         #[cfg(feature = "job_trace")]
         let trace_feed = std::time::Instant::now();
         debug_assert_eq!(self.buf_base, 0);
-        let pos = self.pos;
         // Disjoint field borrows: the state mutates while the input
         // only reads.
         let Self {
-            feed, owned, buf, ..
+            feed,
+            owned,
+            buf,
+            pos,
+            ..
         } = self;
         let feed = feed.as_mut().expect("checked above");
         let input = match owned {
             Some(view) => Self::view_bytes(view),
             None => buf,
         };
-        feed.advance(input, pos);
+        feed.advance(input, upto.min(*pos));
         #[cfg(feature = "job_trace")]
         crate::encoding::job_trace::add_spf_build(trace_feed);
+    }
+
+    /// Advance the windowed chain's publisher over the buffered bytes
+    /// (see [`LdmChain`]): segments walk the bulk build's freeze lattice,
+    /// probing for each freeze before running the inserted fill, and the
+    /// walk parks when the buffered data runs short of the next freeze.
+    /// `done` lands exactly where the bulk build's own terminal `None`
+    /// does, at its scan extent (`stop + SPF_SEG` clamped at the pledge).
+    fn advance_ldm_chain(&mut self) {
+        if self.ldm_chain.is_none() {
+            return;
+        }
+        #[cfg(feature = "job_trace")]
+        let trace_chain = std::time::Instant::now();
+        // Disjoint field borrows: the chain mutates while the input only
+        // reads.
+        let Self {
+            ldm_chain,
+            owned,
+            buf,
+            buf_base,
+            pos,
+            pledged,
+            ..
+        } = self;
+        let Some(chain) = ldm_chain.as_mut() else {
+            return;
+        };
+        if chain.done {
+            return;
+        }
+        if let Some((at, span)) = chain.parked
+            && *pos < at + span.max(SPF_SEG)
+        {
+            return;
+        }
+        let input = match owned {
+            Some(view) => Self::view_bytes(view),
+            None => buf.as_slice(),
+        };
+        // The bulk build's scan extent (`build_ldm_prefix_chain`'s own
+        // `cap`): the walk never reads past it, and the terminal `None`
+        // verdict needs the whole extent buffered.
+        let cap = (chain.stop + SPF_SEG).min(pledged.expect("the chain engages a pledged frame"));
+        while chain.upto < chain.stop {
+            let soft = (chain.upto + SPF_SEG).min(chain.stop);
+            let end = (*pos).min(cap);
+            if end < soft {
+                // The next freeze lies at or beyond `soft`, so a probe
+                // of a shorter span cannot find it: wait for the buffer
+                // to reach it (this also parks the walk between the
+                // pump's fine-cadence steps without a probe).
+                break;
+            }
+            debug_assert!(chain.upto >= *buf_base);
+            let data = &input[..(end - *buf_base) as usize];
+            let from = chain.upto - *buf_base;
+            match chain
+                .state
+                .matcher
+                .ldm_probe_freeze(data, *buf_base, from, soft)
+            {
+                Some(freeze) => {
+                    chain.parked = None;
+                    let filled = chain
+                        .state
+                        .matcher
+                        .ldm_fill_segment(data, *buf_base, from, soft);
+                    debug_assert_eq!(
+                        filled,
+                        Some(freeze),
+                        "the probe's freeze is the one the inserted fill lands on"
+                    );
+                    chain.upto = freeze;
+                    if chain.upto >= chain.next_pub && chain.upto <= chain.stop {
+                        chain
+                            .publishes
+                            .push(Arc::new(chain.state.matcher.ldm_snapshot(chain.upto)));
+                        chain.next_pub = chain.upto + chain.cadence;
+                    }
+                },
+                None => {
+                    if *pos >= cap {
+                        // The bulk build's terminal `None`: the walk is
+                        // done, and uncovered adopters take its fallback.
+                        chain.done = true;
+                    } else {
+                        // The data runs short of the next freeze: the probe
+                        // consumed nothing, so wait for the buffer to grow
+                        // past the scanned span before re-probing (see
+                        // [`LdmChain`]).
+                        chain.parked = Some((*pos, end - chain.upto));
+                    }
+                    break;
+                },
+            }
+        }
+        if chain.upto >= chain.stop {
+            chain.done = true;
+            chain.parked = None;
+        }
+        #[cfg(feature = "job_trace")]
+        crate::encoding::job_trace::add_spf_build(trace_chain);
+    }
+
+    /// The windowed chain's share for the job starting at `start` (the
+    /// caller checked `start > med`): the first publish covering its
+    /// window base — the adoption's byte-invariant class, and a fixed
+    /// element of the deterministic publish list, so the pick cannot
+    /// read posting cadence. When no publish covers the base the done
+    /// fallback serves (the bulk `wait_ldm_snapshot`'s own: the newest
+    /// publish at or below the start, or the cold fill when none
+    /// exists); the post gate guarantees the covered-or-done shape on
+    /// the steady path, while a flush's inline tail job — which the
+    /// caller runs immediately — takes the fallback at whatever the
+    /// walk reached, a cadence-keyed pick on the flush-keyed bytes a
+    /// flush already re-grids.
+    fn chain_snapshot(&self, start: u64) -> JobSpfStream {
+        let Some(chain) = &self.ldm_chain else {
+            unreachable!("the caller checked the engagement");
+        };
+        let win_base = start.saturating_sub(self.overlap as u64);
+        if let Some(snap) = chain.publishes.iter().find(|s| s.upto >= win_base) {
+            return JobSpfStream::WindowedSnap(snap.clone());
+        }
+        match chain.publishes.iter().rev().find(|s| s.upto <= start) {
+            Some(snap) => JobSpfStream::WindowedSnap(snap.clone()),
+            None => JobSpfStream::Windowed,
+        }
     }
 
     /// The far-class screens over the live buffer: the head engagement
@@ -2969,6 +3258,12 @@ impl MtEncoderCore {
             if matches!(self.grid, JobGrid::Growing) {
                 end = end.min(self.growing_epoch_end(self.job_start));
             }
+            // The windowed chain's publish walk runs ahead of the post
+            // gate below (see `LdmChain`): a probe Keep verdict can
+            // engage it up here, and the gate then holds posts until
+            // their covering publishes exist — publishes only this walk
+            // produces, so it runs before the gate reads them.
+            self.advance_ldm_chain();
             if !self.post_due(end) {
                 return;
             }
@@ -3020,7 +3315,24 @@ impl MtEncoderCore {
                 // or its span would miss the splits near the boundary. The
                 // wait stays under one block of stream, so it never holds
                 // the pump behind the pledge.
-                !(self.feed.is_some() && self.pos < self.feed_cover(end))
+                if self.feed.is_some() && self.pos < self.feed_cover(end) {
+                    return false;
+                }
+                // The windowed chain's publish gate: an above-boundary job
+                // posts only once its covering snapshot is published (or
+                // the walk finished, the bulk adopter's own fallback).
+                // Holding the post instead of parking the worker keeps
+                // every wait on the pump, the thread that produces the
+                // publishes.
+                if let Some(chain) = &self.ldm_chain
+                    && self.job_start > chain.med
+                {
+                    let win_base = self.job_start.saturating_sub(self.overlap as u64);
+                    if !chain.publishes.iter().any(|s| s.upto >= win_base) && !chain.done {
+                        return false;
+                    }
+                }
+                true
             },
             JobGrid::Growing => self.pos >= self.growing_epoch_end(self.job_start),
             // The capture lattice's boundaries are absolute like the fixed
@@ -3397,7 +3709,8 @@ impl MtEncoderCore {
         self.resolve_far_class();
         self.resolve_deep_ldm();
         self.resolve_opt_feed();
-        self.advance_feed();
+        self.advance_feed(self.feed_cover(hi).min(self.pos));
+        self.advance_ldm_chain();
         let strip = self.strip_span();
         let strip_lo = self.job_start.saturating_sub(strip as u64);
         debug_assert!(self.buf_base <= strip_lo);
@@ -3447,10 +3760,28 @@ impl MtEncoderCore {
             .feed
             .as_ref()
             .map(|f| (f.span_for(self.job_start, hi, strip_lo), f.window()));
+        // The windowed chain's adopter (the posted arm's twin): a belt
+        // arm on this pool-less path — an engaged frame has posted
+        // before, so the inline tail job here is a flush's, and the
+        // advance above walked what the buffer holds (see
+        // `chain_snapshot`'s fallback). The Arc keeps the picked
+        // publish alive through the run below.
+        let chain_snap = if let Some(chain) = &self.ldm_chain
+            && self.job_start > chain.med
+        {
+            Some(self.chain_snapshot(self.job_start))
+        } else {
+            None
+        };
         let spf = if let Some((span, window)) = &feed_span {
             JobSpf::Feed(span, *window)
         } else if matches!(self.deep_ldm, DeepLdm::Engaged) {
             JobSpf::Windowed(None)
+        } else if let Some(stream) = &chain_snap {
+            match stream {
+                JobSpfStream::WindowedSnap(snap) => JobSpf::Windowed(Some(snap.as_ref())),
+                _ => JobSpf::Windowed(None),
+            }
         } else {
             match &self.fast_capture {
                 FastCapture::Engaged { med } if self.job_start > *med => JobSpf::Windowed(None),
@@ -3476,6 +3807,7 @@ impl MtEncoderCore {
             // arm above).
             &[],
             bt_domain,
+            strip_lo,
         );
         return_pooled_state(state);
         self.push_out_segment(bytes);
@@ -3503,12 +3835,18 @@ impl MtEncoderCore {
         self.resolve_far_class();
         self.resolve_deep_ldm();
         self.resolve_opt_feed();
-        self.advance_feed();
+        self.advance_feed(self.feed_cover(end).min(self.pos));
         // The post cadence is also the assembly and panic-surfacing cadence:
         // per-write calls would burn millions of polls on the pump path.
         self.surface_poison();
         self.assemble_ready();
         self.emit_header();
+        // The windowed chain's publish walk runs ahead of the pick below
+        // (see [`LdmChain`]): the finish tail posts without the steady
+        // gate, so its pick needs the walk advanced to what the input
+        // holds — and the steady path re-runs it for free (the walk is
+        // incremental).
+        self.advance_ldm_chain();
         let strip_lo = start.saturating_sub(self.strip_span() as u64);
         debug_assert!(self.buf_base <= strip_lo);
         let first = (start - strip_lo) as usize;
@@ -3541,11 +3879,24 @@ impl MtEncoderCore {
         // The view is the buffer's [strip_lo, end), so `first` indexes from
         // its head; `freeze` pins the span inside the live extent.
         let frozen = FrozenSrc::freeze(self.input(), (strip_lo - self.buf_base) as usize, len);
-        // The job's prefix-fill share: the finish tail's snapshot (chain
-        // rows) or the engaged fast capture's SelfFill split — the two
-        // never coexist (the tail build is growing-grid-only, the capture
-        // fixed-grid-only), and both are pure functions of the job start.
-        let spf = if let Some(feed) = &self.feed {
+        // The job's prefix-fill share: the windowed chain's publish (the
+        // full-window capture band), the feed's span (the opt rows), the
+        // finish tail's snapshot (the chain rows' growing grid) or the
+        // engaged fast capture's SelfFill split — they never coexist (the
+        // bands are row-disjoint and the tail build is growing-grid-only,
+        // the captures fixed-grid-only), and all are pure functions of
+        // the job start.
+        let spf = if let Some(chain) = &self.ldm_chain {
+            // The windowed capture band's schedule: below-boundary jobs
+            // keep the stock whole-prefix fill (job zero's whole window
+            // is a frame prefix); adopters take the covering publish the
+            // post gate held them for.
+            if start > chain.med {
+                self.chain_snapshot(start)
+            } else {
+                JobSpfStream::None
+            }
+        } else if let Some(feed) = &self.feed {
             JobSpfStream::Feed(Arc::new(feed.span_for(start, end, strip_lo)), feed.window())
         } else {
             match spf {
@@ -3576,6 +3927,7 @@ impl MtEncoderCore {
                 last_frame_block,
                 spf: Mutex::new(spf),
                 donation: Mutex::new(donation),
+                view_base: strip_lo,
                 out: Mutex::new(None),
                 done: core::sync::atomic::AtomicBool::new(false),
             },
@@ -3728,9 +4080,16 @@ impl MtEncoderCore {
 
     /// Lowest absolute offset the buffer must still serve: the next job to
     /// post borrows [job_start - strip, job_start) as its strip, and the
-    /// bytes after it feed that job.
+    /// bytes after it feed that job. While the windowed chain's publisher
+    /// walks (see [`LdmChain`]) its resume point must stay resident too —
+    /// a wrap past it would drop the bytes the next segment scans — so
+    /// the floor follows the walk until it finishes at `stop`.
     fn movable_lo(&self) -> u64 {
-        self.job_start.saturating_sub(self.strip_span() as u64)
+        let lo = self.job_start.saturating_sub(self.strip_span() as u64);
+        match &self.ldm_chain {
+            Some(chain) if !chain.done => lo.min(chain.upto),
+            _ => lo,
+        }
     }
 
     /// Whether every posted job has completed (no resolved pointers into
@@ -3768,6 +4127,14 @@ impl MtEncoderCore {
                 // resumes from there and never returns here.
                 self.surface_poison();
             }
+            // The windowed chain's publisher walks while the pump waits
+            // here: the quiescence is the pump's longest idle, the
+            // buffered bytes it waits on are exactly the walk's input,
+            // and the walk only reads — the in-flight views are
+            // untouched. Each completion wake steps the walk, so the
+            // serial walk hides inside the wait instead of stretching
+            // the posts that follow it.
+            self.advance_ldm_chain();
             self.wait_progress();
         }
         #[cfg(feature = "job_trace")]
@@ -3934,6 +4301,7 @@ impl Drop for MtEncoderCore {
         // nothing reads it anymore. Its length carries the ever-initialized
         // extent to the buffer's next encoder.
         let mut buf = core::mem::take(&mut self.buf);
+        self.retire_ldm_chain();
         // SAFETY: [0, init_len) is initialized (the pump's zero-fill and
         // reads); the extent never exceeds the capacity.
         unsafe { buf.set_len(self.init_len.min(buf.capacity())) };
@@ -3976,14 +4344,18 @@ mod tests {
         tests::mem_gate::{HeavyMem, heavy_mem},
     };
 
-    /// The mid-size capture's engagement predicate at its boundaries. The
-    /// same decision arms the donation (see `post_donation`) and flips the
-    /// jobs (see `engage_midsize_capture`), so the edges are load-bearing:
-    /// inside the band the source-clamped window arms LDM only under the
-    /// `JobPrefix` bar, and a `Job`-armed donation would parse its span
-    /// without LDM there.
+    /// The pledged chain-row capture's engagement predicate at its
+    /// boundaries. The same decision arms the donation (see
+    /// `post_donation`) and flips the jobs (see
+    /// `engage_midsize_capture`), so the edges are load-bearing: inside
+    /// the mid-size band the source-clamped window arms LDM only under
+    /// the `JobPrefix` bar, a `Job`-armed donation would parse its span
+    /// without LDM there, and at W26 and beyond the windowed band takes
+    /// over — the publisher's plan (see [`LdmChain`]) and the adopters'
+    /// schedule key on the same band. The test head is wide (dll-shaped):
+    /// a narrow head's probe never resolves a capture frame.
     #[test]
-    fn midsize_capture_window_boundaries() {
+    fn chain_capture_band_boundaries() {
         // Wide-alphabet head with 8-byte repeats: passes the head screen.
         let mut patterns = Vec::new();
         let mut state = 0x243f_6a88_85a3_08d3u64;
@@ -4002,55 +4374,57 @@ mod tests {
             len: Some(24 * mib),
             window_log: None,
         };
-        // Row 9's source-clamped window is W25: the capture's window.
+        // Row 9's source-clamped window is W25: the mid-size band's
+        // window.
         assert_eq!(
-            midsize_capture_window(Level::Balanced, band, &head, crate::LdmMode::Auto),
-            Some(1 << 25)
+            chain_capture_band(Level::Balanced, band, &head, crate::LdmMode::Auto),
+            Some(CaptureBand::MidSize { window: 1 << 25 })
         );
         // The frame's explicit switch rides the canonical predicate: an
         // armed Disable stands the lattice down, the caller's own gate or
         // not.
         assert_eq!(
-            midsize_capture_window(Level::Balanced, band, &head, crate::LdmMode::Disable),
+            chain_capture_band(Level::Balanced, band, &head, crate::LdmMode::Disable),
             None
         );
-        // Above the band (window W26) the `Job` bar holds: no capture.
+        // At W26 the full-window band takes over: the windowed capture's
+        // publisher arms with the same engagement.
         let above = InputShape {
             len: Some(64 * mib),
             window_log: None,
         };
         assert_eq!(
-            midsize_capture_window(Level::Balanced, above, &head, crate::LdmMode::Auto),
-            None
+            chain_capture_band(Level::Balanced, above, &head, crate::LdmMode::Auto),
+            Some(CaptureBand::Windowed { window: 1 << 26 })
         );
-        // Below it there are no prefix strips worth sharing.
+        // Below the band there are no prefix strips worth sharing.
         let below = InputShape {
             len: Some(8 * mib),
             window_log: None,
         };
         assert_eq!(
-            midsize_capture_window(Level::Balanced, below, &head, crate::LdmMode::Auto),
+            chain_capture_band(Level::Balanced, below, &head, crate::LdmMode::Auto),
             None
         );
         // An open-ended stream never flips (a Growing grid has no capture).
         let open = InputShape::default();
         assert_eq!(
-            midsize_capture_window(Level::Balanced, open, &head, crate::LdmMode::Auto),
+            chain_capture_band(Level::Balanced, open, &head, crate::LdmMode::Auto),
             None
         );
         // A uniform head fails the capture's head screen.
         let zeros = vec![0u8; MAX_BLOCK_SIZE as usize];
         assert_eq!(
-            midsize_capture_window(Level::Balanced, band, &zeros, crate::LdmMode::Auto),
+            chain_capture_band(Level::Balanced, band, &zeros, crate::LdmMode::Auto),
             None
         );
         // Not the LDM chain row: no capture at any size.
         assert_eq!(
-            midsize_capture_window(Level::from_zstd(10), band, &head, crate::LdmMode::Auto),
+            chain_capture_band(Level::from_zstd(10), band, &head, crate::LdmMode::Auto),
             None
         );
         assert_eq!(
-            midsize_capture_window(Level::from_zstd(13), band, &head, crate::LdmMode::Auto),
+            chain_capture_band(Level::from_zstd(13), band, &head, crate::LdmMode::Auto),
             None
         );
     }
@@ -4128,6 +4502,45 @@ mod tests {
         core.write(&head).unwrap();
         assert!(matches!(core.opt_feed, OptFeed::Off));
         assert!(core.feed.is_none());
+    }
+
+    /// The cap keys on the feed shape, not the pledge (see
+    /// `resolve_opt_feed`): a resident source is whole-stream-resident by
+    /// construction — no buffer to recycle, no wrap to lose the frame head —
+    /// so an owned-source frame past the cap arms the feed while the
+    /// buffered twin stands it down. The source here ends far short of the
+    /// pledge, so the frame fails its mismatch gate right after the
+    /// engagement and the test reads the arming off the error path.
+    #[test]
+    fn opt_feed_owned_source_arms_past_the_cap() {
+        // The engagement reads the process-global feed switch; serialize
+        // against the tests that stand it down under this lock.
+        let _switch = crate::encoding::mt::FEED_TEST_SWITCH.lock().unwrap();
+        let _mem = heavy_mem(HeavyMem::Mid);
+        let mib = 1024 * 1024u64;
+        let mut head = Vec::new();
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let patterns: Vec<_> = (0..96)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                state.to_le_bytes()
+            })
+            .collect();
+        let mut pick = 0xdead_beef_cafeu64;
+        while head.len() < mib as usize {
+            pick = pick.wrapping_mul(6364136223846793005).wrapping_add(1);
+            head.extend_from_slice(&patterns[(pick >> 33) as usize % 96]);
+        }
+        let over_cap = &EncoderOptions::new(Level::Opt)
+            .workers(4)
+            .pledged_size(Some(BUF_CAP_MAX as u64 + mib));
+        let mut core = MtEncoderCore::new_owned_source(over_cap, None, OwnedView::new(&head));
+        assert!(matches!(
+            core.pump_owned(&head),
+            Err(crate::Error::PledgedSizeMismatch { .. })
+        ));
+        assert!(matches!(core.opt_feed, OptFeed::Engaged));
+        assert!(core.feed.is_some());
     }
 
     /// The unpledged schedule keeps a burst's jobs equal while a pledged one
@@ -4748,6 +5161,7 @@ mod tests {
                 ldm: LdmArming::Job,
                 spf: Mutex::new(JobSpfStream::None),
                 donation: Mutex::new(None),
+                view_base: 0,
                 out: Mutex::new(None),
                 done: core::sync::atomic::AtomicBool::new(false),
             },
@@ -4796,6 +5210,7 @@ mod tests {
                     ldm: LdmArming::Job,
                     spf: Mutex::new(JobSpfStream::None),
                     donation: Mutex::new(None),
+                    view_base: 0,
                     out: Mutex::new(None),
                     done: core::sync::atomic::AtomicBool::new(false),
                 },
@@ -4886,6 +5301,7 @@ mod tests {
                 ldm: LdmArming::Job,
                 spf: Mutex::new(JobSpfStream::None),
                 donation: Mutex::new(None),
+                view_base: 0,
                 out: Mutex::new(None),
                 done: core::sync::atomic::AtomicBool::new(false),
             },
