@@ -6,7 +6,7 @@ use core::convert::TryInto;
 #[cfg(feature = "std")]
 use super::ldm::LdmSeq;
 #[cfg(feature = "std")]
-use super::match_generator::{LdmPrefixSnapshot, StripSnapshot};
+use super::match_generator::{LdmPrefixSnapshot, RowSharedStrip, StripSnapshot};
 use super::{
     Matcher,
     block_enc::compressed::DictEntropy,
@@ -985,6 +985,13 @@ pub(crate) enum JobSpf<'a> {
     /// an adopted match window (the opt consumer prices the stored span,
     /// which generation verified over the whole input).
     Feed(&'a [LdmSeq], u64),
+    /// The reach-band shared row-strip adoption: the row family's entry
+    /// table comes from the shared build's whole-span clone plus a replay
+    /// of the job's own stock strip span's grid inserts, while the LDM
+    /// state, gate replay and seed scan still run the stock per-job path
+    /// over the same span (every non-table state matches a stock job
+    /// exactly).
+    Shared(&'a RowSharedStrip, usize),
 }
 
 /// [`compress_job_blocks`] with a donated prefix: `start_cursor` blocks of
@@ -1090,6 +1097,16 @@ pub(crate) fn compress_job_blocks_inner(
                 // probe the far twins its parse cannot reach.
                 let win_base = job.start.saturating_sub(window as usize);
                 state.matcher.seed_gate_span(&src[win_base..job.start]);
+            }
+        },
+        JobSpf::Shared(shared, ldm_span) => {
+            if start_cursor <= job.start {
+                let ldm_base = job.start.saturating_sub(ldm_span);
+                state.matcher.adopt_row_strip_shared(
+                    shared,
+                    &src[ldm_base..job.start],
+                    ldm_base as u64,
+                );
             }
         },
     }

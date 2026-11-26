@@ -74,6 +74,11 @@ pub struct Snapshot {
     pub spf_ldm_ns: u64,
     /// The builder's chain grid segments (a sub-span of `spf_build_ns`).
     pub spf_chain_ns: u64,
+    /// The caller-side reach-band shared row-strip build
+    /// (`fill_row_strip_shared_build` plus its snapshot clone). NOT a
+    /// sub-span of `prefill_ns` — it runs on the posting thread, the
+    /// same reason `spf_build_ns` carries its own span.
+    pub row_build_ns: u64,
     /// The adopters' LDM remainder fills (`strip_fill_continue`).
     pub adopt_ldm_ns: u64,
     /// The adopters' chain grid remainders (`strip_fill_continue`).
@@ -195,6 +200,7 @@ counters! {
     ldm_fill_ns,
     ldm_insert_ns,
     spf_build_ns,
+    row_build_ns,
     job_ns,
     prefill_ns,
     clear_ns,
@@ -356,6 +362,14 @@ pub fn add_ldm_insert(started: Instant) {
 #[inline]
 pub fn add_spf_build(started: Instant) {
     add_ns(&C.spf_build_ns, started.elapsed());
+}
+
+/// Record one caller-side reach-band shared row-strip build span
+/// (`fill_row_strip_shared_build` plus its snapshot clone — see
+/// [`Snapshot::row_build_ns`]).
+#[inline]
+pub fn add_row_build(started: Instant) {
+    add_ns(&C.row_build_ns, started.elapsed());
 }
 
 /// Record one builder LDM segment span (`strip_fill_segment`'s

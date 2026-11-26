@@ -550,6 +550,22 @@ pub(crate) struct StripSnapshot {
     upto: u64,
 }
 
+/// The reach-band shared strip's captured build state: the row family's
+/// packed entry table plus its per-row cycling heads after a grid fill of
+/// `[0, upto)`. The 24-bit wrap resolves an entry written at any
+/// frame-absolute position exactly for every in-window candidate — the
+/// +1 packing bias and the tag byte cancel mod 2^24, so the distance
+/// arithmetic needs no per-job coordinate domain — and entries beyond a
+/// job's window alias to wrapped in-window positions the byte verify
+/// rejects or accepts as real matches, the same class the
+/// frame-continuous row parse runs under past 2^24. A whole-table clone
+/// is therefore a legal strip adoption without origin-carrying entries.
+#[cfg(feature = "std")]
+pub(crate) struct RowSharedStrip {
+    tables: HeadTables,
+    row_heads: Vec<u8>,
+}
+
 /// Captured LDM fill state for the windowed capture band (the full-window
 /// population of [`MatchGeneratorDriver::prefix_ldm_window`]): the LDM
 /// table after a sequential fill of `[0, upto)` stopped at a batch-freeze
@@ -2417,6 +2433,100 @@ impl MatchGeneratorDriver {
             ldm: self.ldm.as_ref().map(LdmState::snapshot),
             origin: self.head_origin,
             upto,
+        }
+    }
+
+    /// The shared strip's builder half: the strip grid fill over the shared
+    /// span with the LDM ingest deferred — the adopters run their own
+    /// stock strip-span LDM state, so the builder's would be discarded
+    /// work (the wasted gate replay and seed scan over the build span
+    /// ride the build-span reading conservatively).
+    #[cfg(feature = "std")]
+    pub(crate) fn fill_row_strip_shared_build(&mut self, data: &[u8], base: u64) {
+        self.fill_window_grid(data, base, FillGrid::Strip, LdmStripFill::Defer);
+    }
+
+    /// The shared strip's build capture: the row family's whole entry
+    /// table plus the cycling heads (the pair a per-job fill clears
+    /// together).
+    #[cfg(feature = "std")]
+    pub(crate) fn row_strip_snapshot(&self) -> RowSharedStrip {
+        debug_assert!(matches!(self.params.strategy, Strategy::Row(_)));
+        RowSharedStrip {
+            tables: self.tables.clone(),
+            row_heads: self.row_heads.clone(),
+        }
+    }
+
+    /// The shared strip's adopter half: take the shared build's tables in
+    /// place of the per-job clear-plus-fill, replay the job's own stock
+    /// strip span's grid inserts on top (the shared table's newest-16
+    /// per row are tail-dominated, so without the replay a job's near
+    /// history is evicted — the single-snapshot form's textreal
+    /// inversion), then run exactly the stock job's LDM ingest, gate
+    /// replay and seed scan over the same span, so every non-table state
+    /// matches a stock job bit for bit.
+    #[cfg(feature = "std")]
+    pub(crate) fn adopt_row_strip_shared(
+        &mut self,
+        shared: &RowSharedStrip,
+        strip_win: &[u8],
+        strip_base: u64,
+    ) {
+        debug_assert!(matches!(self.params.strategy, Strategy::Row(_)));
+        debug_assert_eq!(self.tables.len(), shared.tables.len());
+        self.dubt_head = HeadPhase::Off;
+        self.bt_step = BtStepPhase::Off;
+        self.dict_prefix = false;
+        self.tables.clone_from(&shared.tables);
+        self.row_heads.clone_from_slice(&shared.row_heads);
+        self.gap_start = u64::MAX;
+        self.gate_hold = false;
+        self.strip_parse = true;
+        self.ldm_quiet = 0;
+        self.ldm_dead = false;
+        self.ldm_canary = 0;
+        if let Some(ldm) = &mut self.ldm {
+            ldm.restart(strip_base);
+            if strip_win.len() >= super::ldm::MIN_MATCH_LENGTH {
+                ldm.fill(
+                    strip_win,
+                    strip_base,
+                    strip_base,
+                    strip_base + strip_win.len() as u64,
+                );
+            }
+        }
+        let uniform = strip_is_uniform(strip_win);
+        self.seed_gate_probe(strip_win, uniform);
+        if strip_win.len() >= HASH_READ {
+            // The replay: the stock Row fill's insert loop over the same
+            // stride grid, continuing the build's cycling heads (any
+            // stride-aligned cut resumes exactly; re-inserted positions
+            // merely claim the next slot).
+            let Strategy::Row(row_log) = self.params.strategy else {
+                unreachable!();
+            };
+            let hash_log = self.params.hash_log;
+            let width = ChainHashWidth::of(self.dict_row);
+            let tables = RowHandle::at(
+                self.tables.buf_mut().as_mut_ptr(),
+                self.row_heads.as_mut_ptr(),
+                self.row_heads.len(),
+            );
+            let last = strip_win.len() - HASH_READ;
+            let mut idx = 0usize;
+            while idx < last {
+                let abs = strip_base + idx as u64;
+                let h = row_hash_at(strip_win, idx, hash_log, row_log, width);
+                match row_log {
+                    4 => row_insert_fill::<4>(tables, h, abs),
+                    5 => row_insert_fill::<5>(tables, h, abs),
+                    _ => row_insert_fill::<6>(tables, h, abs),
+                }
+                idx += PREFILL_STRIDE;
+            }
+            self.acquire_seed(strip_win, last);
         }
     }
 

@@ -613,7 +613,7 @@ fn print_cfg_mt(level: i32, workers: u32) {
             Record::Frame(f) => println!(
                 "  frame: jobs {} x {} B, overlap {}, strip {}, fast_window {:?}, capture_window \
                  {:?}, deep_ldm {:?}, opt_feed {:?}, job_prefix_ldm {}, header_window {}, \
-                 reach_keep {}, donated {}, spf {:?}, bal_store {:?}",
+                 reach_keep {}, donated {}, spf {:?}, bal_store {:?}, shared_row_strip {}",
                 f.n_jobs,
                 f.job_size,
                 mib(f.job_overlap),
@@ -628,6 +628,7 @@ fn print_cfg_mt(level: i32, workers: u32) {
                 f.donated,
                 f.spf,
                 f.bal_store,
+                f.shared_row_strip,
             ),
             Record::Job(j) => println!(
                 "  job@{}: rep_gated={} ramp={} {}",

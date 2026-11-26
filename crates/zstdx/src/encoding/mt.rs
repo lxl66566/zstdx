@@ -38,8 +38,8 @@ use super::{
     ldm::{LdmSeq, LdmState},
     match_generator::{
         BALANCED_STORE_HEAD_SPAN, BT_DOMAIN_DENSE_SPAN, BalancedStore, BtDomain, LDM_FULL_WINDOW,
-        LdmArming, LdmPrefixSnapshot, MatchGeneratorDriver, SPF_MIN_PREFIX, SPF_SEG, StripSnapshot,
-        balanced_store, bt_domain_class, ldm_head_parses,
+        LdmArming, LdmPrefixSnapshot, MatchGeneratorDriver, RowSharedStrip, SPF_MIN_PREFIX,
+        SPF_SEG, StripSnapshot, balanced_store, bt_domain_class, ldm_head_parses,
     },
     reach_probe,
 };
@@ -335,8 +335,7 @@ pub fn compress_slice_mt(
         ldm_mode,
     );
 
-    #[cfg(feature = "cfg_dump")]
-    let donation_donated = donation.is_some();
+    let donated = donation.is_some();
     let donation = Mutex::new(donation);
     // The btlazy rows' domain class, resolved once from the frame's head
     // before any schedule reads the domain (the ST entry's own resolution
@@ -471,6 +470,40 @@ pub fn compress_slice_mt(
     } else {
         LdmArming::Job
     };
+    // The reach-band shared strip (R125): on the plain-lattice class the
+    // storage substitution armed, the jobs adopt one shared row-strip
+    // build — the calling thread fills the union of their 16 MiB reach
+    // strips once and publishes the final table snapshot, each later job
+    // clones it, replays its own stock strip span's grid inserts on top
+    // (the snapshot's newest-per-row are tail-dominated, so without the
+    // replay a job's near history is evicted), and runs its stock LDM
+    // ingest, gate replay and seed scan over the same span — instead of
+    // the per-job clear-plus-fill. The reach window widens to the twin's
+    // 16 MiB chain reach (one step under the row entry's 24-bit wrap, so
+    // the shared frame-absolute entries resolve for in-window candidates
+    // and beyond-window residue aliases to byte-verify-rejected phantoms,
+    // the same class the ST frame-continuous row parse itself runs under
+    // past 16 MiB), while the grid, the job size and job zero's stock
+    // empty-strip start stay put.
+    let shared_row_strip = shared_row_strip_arms(
+        bal_store,
+        donated,
+        &spf,
+        deep_ldm,
+        opt_feed,
+        dict.is_some(),
+        n_jobs,
+    );
+    let (job_overlap, shared_gate) = if shared_row_strip {
+        // The twin's chain reach (see `balanced_row_params`: the row's
+        // search domain, one step under the 24-bit entry wrap).
+        (
+            1 << 24,
+            Some(Arc::new(Monitor::new(None::<Arc<RowSharedStrip>>))),
+        )
+    } else {
+        (job_overlap, None)
+    };
     #[cfg(feature = "cfg_dump")]
     super::cfg_dump::record(super::cfg_dump::Record::Frame(
         super::cfg_dump::FrameRecord {
@@ -485,7 +518,7 @@ pub fn compress_slice_mt(
             job_prefix_ldm: job_ldm == LdmArming::JobPrefix,
             header_window: window,
             reach_keep: choice == reach_probe::ReachChoice::Keep,
-            donated: donation_donated,
+            donated,
             spf: match spf.as_ref() {
                 None => super::cfg_dump::SpfTag::None,
                 Some(PrefixPlan::Whole { .. }) => super::cfg_dump::SpfTag::Whole,
@@ -497,6 +530,7 @@ pub fn compress_slice_mt(
                 BalancedStore::Row => super::cfg_dump::StoreTag::Row,
                 BalancedStore::RowHead => super::cfg_dump::StoreTag::RowHead,
             },
+            shared_row_strip,
         },
     ));
 
@@ -609,6 +643,23 @@ pub fn compress_slice_mt(
                         // job owns its whole-window LDM fill (job zero's
                         // empty span folds to the stock job-start state).
                         JobSpfOwned::Windowed(None)
+                    } else if let Some(gate) = shared_gate.as_ref() {
+                        // The shared strip: job zero keeps the stock
+                        // empty-strip start; every later job waits for the
+                        // calling thread's shared build and adopts its
+                        // final table snapshot plus its own strip replay.
+                        if id == 0 {
+                            JobSpfOwned::None
+                        } else {
+                            match wait_shared_row_strip(gate, &poison) {
+                                Some(s) => JobSpfOwned::Shared(s, strip),
+                                None => {
+                                    *slots[id].lock() = Some(Vec::new());
+                                    broadcast_poison();
+                                    break;
+                                },
+                            }
+                        }
                     } else {
                         match spf.as_ref() {
                             Some(PrefixPlan::SelfFill { med }) if start as u64 > *med => {
@@ -730,6 +781,40 @@ pub fn compress_slice_mt(
             });
         }
 
+        // The reach-band shared row-strip build on the calling thread
+        // while the workers encode: one grid fill over the union of the
+        // substitution jobs' reach strips, published as a single final
+        // snapshot every later job adopts. Job zero never reads it. The
+        // build's span posts on its own caller-side counter for the same
+        // reason the shared prefix fill's does: posting-thread work the
+        // per-job spans cannot see.
+        if let Some(gate) = &shared_gate {
+            #[cfg(feature = "job_trace")]
+            let trace_row = std::time::Instant::now();
+            let union_end = (n_jobs - 1) * job_size;
+            let mut bstate = take_slice_state(level, shape, choice, LdmArming::Job);
+            prepare_job_state(
+                &mut bstate,
+                level,
+                shape,
+                choice,
+                LdmArming::Job,
+                0,
+                ldm_mode,
+                bal_head,
+                bt_domain,
+            );
+            bstate
+                .matcher
+                .fill_row_strip_shared_build(&src[..union_end], 0);
+            let shared = Arc::new(bstate.matcher.row_strip_snapshot());
+            return_slice_state(bstate);
+            #[cfg(feature = "job_trace")]
+            crate::encoding::job_trace::add_row_build(trace_row);
+            *gate.lock() = Some(shared);
+            gate.notify_all();
+        }
+
         // Build the shared prefix fill on the calling thread while the
         // workers encode: one sequential fill to the median boundary in
         // place of the tail jobs' redundant whole-prefix fills. The
@@ -846,6 +931,31 @@ pub(crate) fn head_predicts_keep(head: &[u8]) -> bool {
 /// bytes through the shared prefix fill, whose snapshot machinery has no
 /// row-store twins. Dictionary frames keep the chain like the ST
 /// dictionary entry, which never resolves a verdict.
+/// The reach-band shared strip's arming class (see `compress_slice_mt`):
+/// the storage substitution armed a plain-lattice frame — no shared
+/// prefix fill, no deep rows, no opt feed, no dictionary, no donation (a
+/// wide head predicts the Keep the donation's probe wants to measure) —
+/// and the geometry leaves more than job zero plus a lone adopter (the
+/// build's span rides the calling thread's critical path, so a two-job
+/// frame pays it with no adopting majority to amortize the stagger).
+fn shared_row_strip_arms(
+    bal_store: BalancedStore,
+    donated: bool,
+    spf: &Option<PrefixPlan>,
+    deep_ldm: Option<u64>,
+    opt_feed: Option<u64>,
+    dict: bool,
+    n_jobs: usize,
+) -> bool {
+    !matches!(bal_store, BalancedStore::Chain)
+        && !donated
+        && spf.is_none()
+        && deep_ldm.is_none()
+        && opt_feed.is_none()
+        && !dict
+        && n_jobs > 2
+}
+
 fn plain_job_balanced_store(
     level: Level,
     shape: crate::InputShape,
@@ -1481,7 +1591,14 @@ enum JobSpfOwned {
     None,
     Whole(Option<Arc<StripSnapshot>>),
     Windowed(Option<Arc<LdmPrefixSnapshot>>),
-    Feed { span: Vec<LdmSeq>, window: u64 },
+    Feed {
+        span: Vec<LdmSeq>,
+        window: u64,
+    },
+    /// The reach-band shared row-strip adoption (see [`RowSharedStrip`]):
+    /// the shared build's snapshot plus the stock strip span the job's
+    /// own LDM ingest and grid replay cover.
+    Shared(Arc<RowSharedStrip>, usize),
 }
 
 impl JobSpfOwned {
@@ -1496,6 +1613,7 @@ impl JobSpfOwned {
             },
             JobSpfOwned::Windowed(snap) => JobSpf::Windowed(snap.as_deref()),
             JobSpfOwned::Feed { span, window } => JobSpf::Feed(span, *window),
+            JobSpfOwned::Shared(snap, ldm_span) => JobSpf::Shared(snap, *ldm_span),
         }
     }
 }
@@ -2088,6 +2206,26 @@ fn build_prefix_snapshot(
 /// the build publishes through the share's own monitor, the poison through
 /// the pool's broadcast. Lock order share→poison is one-sided, like
 /// the assembly's slot→poison.
+/// Block until the calling thread publishes the reach-band shared
+/// row-strip build (or a poisoned pool aborts the wait). `None` under
+/// poison (the caller releases the slot and broadcasts so the ordered
+/// assembly drains before the panic resumes).
+fn wait_shared_row_strip(
+    share: &Monitor<Option<Arc<RowSharedStrip>>>,
+    poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
+) -> Option<Arc<RowSharedStrip>> {
+    let mut guard = share.lock();
+    loop {
+        if let Some(shared) = guard.as_ref() {
+            return Some(Arc::clone(shared));
+        }
+        if poison.lock().unwrap().is_some() {
+            return None;
+        }
+        guard = share.wait(guard);
+    }
+}
+
 fn wait_prefix_build(
     share: &Arc<Monitor<Option<PrefixBuild>>>,
     poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
@@ -2359,9 +2497,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        CAPTURE_JOB_CAP, MIN_JOB_SIZE, capture_grid, capture_job_size, compress_slice_mt,
-        dict_job_arming, donation_arming, fast_capture_schedule, head_predicts_keep, job_size_for,
-        plain_job_balanced_store, plan_prefix_ldm, prefix_last_job, take_slice_state,
+        CAPTURE_JOB_CAP, MIN_JOB_SIZE, PrefixPlan, capture_grid, capture_job_size,
+        compress_slice_mt, dict_job_arming, donation_arming, fast_capture_schedule,
+        head_predicts_keep, job_size_for, plain_job_balanced_store, plan_prefix_ldm,
+        prefix_last_job, shared_row_strip_arms, take_slice_state,
     };
     use crate::{
         Level,
@@ -2633,11 +2772,92 @@ mod tests {
         }
     }
 
+    /// The shared strip's arming class: the substitution's row twin is
+    /// necessary, and every build band above, a dictionary, a donation and
+    /// a two-job geometry keep the stock per-job strips.
+    #[test]
+    fn shared_row_strip_arms_only_the_plain_lattice_class() {
+        let row = BalancedStore::Row;
+        let chain = BalancedStore::Chain;
+        let spf_none: Option<PrefixPlan> = None;
+        assert!(shared_row_strip_arms(
+            row, false, &spf_none, None, None, false, 8
+        ));
+        // Every disjunct alone keeps the stock strips.
+        assert!(!shared_row_strip_arms(
+            chain, false, &spf_none, None, None, false, 8
+        ));
+        assert!(!shared_row_strip_arms(
+            row, true, &spf_none, None, None, false, 8
+        ));
+        assert!(!shared_row_strip_arms(
+            row,
+            false,
+            &spf_none,
+            Some(4),
+            None,
+            false,
+            8
+        ));
+        assert!(!shared_row_strip_arms(
+            row,
+            false,
+            &spf_none,
+            None,
+            Some(4),
+            false,
+            8
+        ));
+        assert!(!shared_row_strip_arms(
+            row, false, &spf_none, None, None, true, 8
+        ));
+        assert!(!shared_row_strip_arms(
+            row, false, &spf_none, None, None, false, 2
+        ));
+        // The lone adopter in a two-job frame reads the same geometry as
+        // the substitution itself: the class keeps its stock strip there.
+        assert!(shared_row_strip_arms(
+            row, false, &spf_none, None, None, false, 3
+        ));
+    }
+
+    /// The shared strip rides the pooled job states like any schedule:
+    /// repeated in-process calls over a real multi-strip build (wide head
+    /// past the probe's size bar, eight jobs so seven adopt the shared
+    /// snapshot) reproduce the armed bytes bit for bit, and the frame
+    /// roundtrips. The pool warm path is where a stale builder state
+    /// would surface, so the second and third calls pin it.
+    #[test]
+    fn shared_row_strip_bulk_mt_is_pooled_deterministic() {
+        let armed = pattern_head(16 << 20);
+        let enc = |src: &[u8]| {
+            compress_slice_mt(
+                src,
+                Level::Balanced,
+                false,
+                8,
+                None,
+                None,
+                None,
+                crate::LdmMode::Auto,
+            )
+        };
+        let one = enc(&armed);
+        let two = enc(&armed);
+        assert_eq!(one, two);
+        let three = enc(&armed);
+        assert_eq!(one, three);
+        let mut back = vec![0u8; armed.len()];
+        let n = FrameDecoder::new().decode_all(&one, &mut back).unwrap();
+        assert_eq!((n, &back[..n]), (armed.len(), &armed[..]));
+    }
+
     /// The substitution rides the pooled job states like any schedule:
     /// repeated in-process calls, a stock chain frame interleaved between
     /// two armed ones, and the roundtrip all hold. The armed fixture is a
     /// wide head past the probe's size bar (the population
-    /// `plain_job_balanced_store` gates), the interleaved one a narrow
+    /// `plain_job_balanced_store` gates — with the shared strip armed
+    /// too, four jobs so three adopt), the interleaved one a narrow
     /// head over the same bar, so the pool round-trips the row store and
     /// the chain flip-back in one process.
     #[test]

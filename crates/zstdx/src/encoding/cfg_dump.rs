@@ -160,6 +160,11 @@ pub struct FrameRecord {
     /// The jobs' storage verdict (see `plain_job_balanced_store`): the
     /// balanced row's twin when the frame armed the substitution.
     pub bal_store: StoreTag,
+    /// The reach-band shared strip armed: the jobs adopt the calling
+    /// thread's shared row-strip build in place of the per-job
+    /// clear-plus-fill, and `job_overlap` carries the twin's 16 MiB
+    /// reach.
+    pub shared_row_strip: bool,
 }
 
 #[derive(Debug)]

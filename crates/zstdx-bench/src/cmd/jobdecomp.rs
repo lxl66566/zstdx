@@ -210,6 +210,11 @@ mod trace {
             ms(s.spf_build_ns),
         );
         println!(
+            "  row build  {:>8.2} ms (caller-side; the reach-band shared strip — not in the job \
+             sums above)",
+            ms(s.row_build_ns),
+        );
+        println!(
             "  probe      {:>8.2} ms (caller-side, pre-jobs; the reach donation's keep/shrink \
              parses and verdict)",
             ms(s.probe_ns),
@@ -331,6 +336,7 @@ mod trace {
             ldm_fill_ns,
             ldm_insert_ns,
             spf_build_ns,
+            row_build_ns,
             probe_ns,
             spf_ldm_ns,
             spf_chain_ns,
@@ -365,6 +371,7 @@ mod trace {
         acc.pump_calls += pump_calls;
         acc.job_ns += job_ns;
         acc.spf_build_ns += spf_build_ns;
+        acc.row_build_ns += row_build_ns;
         acc.probe_ns += probe_ns;
         acc.prefill_ns += prefill_ns;
         acc.reset_ns += reset_ns;
