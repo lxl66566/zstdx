@@ -14,3 +14,4 @@ crates/zstdx/fuzz/corpus
 /bench/big
 /bench/scratch
 /test*
+/.agents/todograph/.lock

@@ -30,7 +30,7 @@ Output moves exactly where the boundary case fires. The dump grids move 5 cells,
 | Insert-side per-position floor against C's fill-target-based windowLow | lenient superset | Admits candidates in `[pos-max_window, target-max_window)` during fills, and the search-side floors match C. |
 | Dictionary frames probe the first payload position, where C's `ip += (ip==prefixStart)` skips it | lenient, one position | Negligible and recorded here. |
 | POS_BIAS makes window position 0 a representable candidate, where C's matchLow=1 excludes it | lenient | Documented in the POS_BIAS comment. |
-| Insert-side count cap at `idx + OPT_NUM`, clamp_lag gating, and `cand_floor`'s stock search domain on dictionary content | documented deliberate | Recorded in code and in [pitfalls/encoding](../pitfalls/encoding.md). The count cap is a measured speed and ratio trade, and the dictionary domain is managed by the skip-shape guard. |
+| Insert-side count cap at `idx + OPT_NUM`, clamp_lag gating, and `cand_floor`'s stock search domain on dictionary content | documented deliberate | Recorded in code and in [pitfalls/encoding](../pitfalls/encoding/codegen.md). The count cap is a measured speed and ratio trade, and the dictionary domain is managed by the skip-shape guard. |
 
 ## Verified sound, no finding
 
@@ -38,7 +38,7 @@ Read bounds at tails hold, because the hash, count and byte reads are bounded by
 
 ## Pitfall
 
-The shared-cursor hoist trap is recorded in [pitfalls/encoding](../pitfalls/encoding.md). hash3's fill cursor rides `next_update`, and the eager seed moved one without the other. The gap is unreachable on the current ladder, because every hash3 user row has mls of 3, so the 22-bit main tree shadows the 17-bit slot. This was probed byte-identical on plain and adversarial rep-suppressed fixtures. The prefill that closes the gap landed as described in the [follow-ups below](#follow-ups-resolved).
+The shared-cursor hoist trap is recorded in [pitfalls/encoding](../pitfalls/encoding/codegen.md). hash3's fill cursor rides `next_update`, and the eager seed moved one without the other. The gap is unreachable on the current ladder, because every hash3 user row has mls of 3, so the 22-bit main tree shadows the 17-bit slot. This was probed byte-identical on plain and adversarial rep-suppressed fixtures. The prefill that closes the gap landed as described in the [follow-ups below](#follow-ups-resolved).
 
 ## Follow-ups resolved
 

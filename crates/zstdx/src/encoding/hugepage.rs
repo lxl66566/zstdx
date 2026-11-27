@@ -5,7 +5,7 @@
 //! big alloc/free cycle the allocator hands the next multi-MiB table
 //! physically scattered pages; the frozen layout then taxes every access
 //! for the table's whole lifetime (dTLB misses; the 2026-09-29 dispersity
-//! root-cause in docs/src/dev/pitfalls/workflow.md). Buffers at or above
+//! root-cause in docs/src/dev/pitfalls/workflow/measurement.md). Buffers at or above
 //! [`HUGE_MIN_BYTES`] are therefore placed in private anonymous mappings
 //! advised `MADV_HUGEPAGE`, so the hugepage backing does not depend on the
 //! system THP setting. Everything smaller — and any non-Linux target or

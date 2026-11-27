@@ -174,6 +174,25 @@ The spine island is bit-exact over every captured stream and buys 5.2% and 6.2% 
 
 Falsified at prototype, against a bar of 5% per-position: the whole-loop form's measurable ceiling sits under the bar, and the one growth direction past the spine measured negative. The remaining unowned shares, the extends at 14% and emit plus `rep1_chain` at 11%, are shared call targets in every variant here, and fusing them would multiply the boundary cost the prefilter result already prices. The harness itself is the round's keep: the capture hook is in-tree behind `job_trace`, and the replay numbers above reproduce from `ZSTDX_SCAN_CAPTURE` dumps in about a second per capture.
 
+### Deferred fastest match-event materialization
+
+R129 tested two whole-pipeline event representations in the plain fastest scan. The first staged `(ll, ml, of_value)` triples in a temporary vector, retained repcode history and covered-table writes in scan order, and materialized literals plus `SeqWord`s at block exit. The second eliminated the temporary vector and treated the existing `SeqWord` stream as the events: the scan packed sequences and updated history as before, while block exit recovered LL/ML from the packed words and copied only the literal spans. Both forms were byte-identical on jsonreal, textreal and skewed across bulk, stream and MT and passed the 45 matcher tests. Neither form has a size trade.
+
+Twelve-iteration jsonreal perf-stat runs priced the added work against base. The temporary-event form moved instructions 6.549G to 6.998G (+6.86%), L1 loads 2.274G to 2.614G (+14.96%) and branch misses 32.10M to 39.51M (+23.08%). The packed-event form still read 6.951G instructions (+6.14%), 2.378G L1 loads (+4.58%) and 36.73M branch misses (+14.43%). A six-round, position-balanced, locked A/B against the preserved base binary read:
+
+| Candidate | jsonreal candidate/base | textreal candidate/base |
+|---|---:|---:|
+| Temporary 12-byte events | 760.5/851.0 MiB/s, 0.894x | 223.5/244.0, 0.914x |
+| Packed events with deferred literals | 793.0/849.0, 0.933x | 226.0/245.0, 0.920x |
+
+The scan owns about 60% of cycles on both real cells, yet removing output state from its live set cannot fund a second per-sequence materialization pass. Deferred scan output is closed in both the temporary-event and existing-`SeqWord` carriers. Reopening needs an event representation with no additional per-sequence read pass and counter evidence that its scan-side saving exceeds its materialization cost before another whole-cell A/B.
+
+### Inline packed-field scan residency
+
+The follow-up kept emission inline, per todo 49's condition, and attacked the scan's live-state pressure instead: candidate and event fields packed into fewer registers-held words so each sequence materializes immediately with no post-pass. A field bisect against the locked jsonreal and textreal fastest cells priced the packing halves separately. Entry-only packing read jsonreal at 1.61% fewer cycles and textreal at a 0.15% regression; current-word-only packing read jsonreal at 1.52% fewer and textreal at a 0.48% regression. The combined form was the best arm at 2.64% fewer jsonreal cycles and 0.22% fewer textreal cycles, and it stays below the registered 3% whole-cell gate with no size trade to fund it.
+
+The packing's scan-side saving saturates at the combined form: each half buys the other cell a regression, so no field arrangement in this family clears the bar. All probes were reverted and no source changed. The row reopens only with counter evidence that a different inline residency schedule cuts more than the measured 2.6% ceiling or that a new event representation removes register pressure the packing cannot.
+
 ## Fast-tier hash and table geometry
 
 ### hash4 revivals
@@ -252,6 +271,30 @@ Changing table entries from u64 to u32 at Fastest 2^15 with a 2-bit epoch scheme
 
 The balanced storage swap's frontier sweep tried the L10 geometry as the row twin, `row(22, 5, W26, 31 attempts)` with LDM at the W24 search domain, against the landed `row(21, 4, W26, 15)`. The wider row bought size on every column, text 88,608 against 89,436 bytes and dll100 19,380,181 against 19,518,759, but read dll100 at 71 MiB/s against the landed twin's 134 and the chain's 114, x1.82 against libzstd. Dll's candidates sit dense in their rows, so 31 verifies per position are pure scan volume, and the twin's density on that shape is carried by the LDM far classes the attempts never touch. Text's +0.9% from the wider row is redundant behind the cold-start head, which lands the text frame byte-identical to the chain's at either geometry. The dll class refuses the trade; the record is the swap's landing evidence, not a general rowLog verdict, and reopens only if the dll class's density bar moves.
 
+### Whole-strategy lighter-row Pareto
+
+R129 measured the balanced row against the existing chain, dfast and level-8 row configurations at API level 9 on jsonreal, textreal, synthetic json and synthetic text. All sizes below are exact bytes from release builds; libzstd 1.6.0 is the same-session level-9 reference. The dfast and level-8 substitutions temporarily replaced `params_for_level(9)` with the shipped `LEVEL_PARAMS[3]` and `LEVEL_PARAMS[8]` rows and were reverted after the measurements. The chain arm used the existing `ZSTDX_CFG_DUMP_ST_CHAIN` probe latch in the same `cfg_dump` binary as the shipped row.
+
+| Cell | dfast L3 configuration | level-8 row configuration | balanced chain | shipped balanced | libzstd-9 bar |
+|---|---:|---:|---:|---:|---:|
+| jsonreal | 3,684,504 (+17.355%) | 3,265,813 (+4.019%) | 3,137,948 (-0.053%) | 2,828,334 | 3,139,622 |
+| textreal | 11,896,929 (+13.924%) | 10,647,379 (+1.959%) | 10,687,816 (+2.346%) | 10,379,907 | 10,442,826 |
+| json | 6,336,103 (+12.356%) | 4,643,376 (-17.661%) | 4,661,008 | 4,661,008 | 5,639,335 |
+| text | 100,755 (+13.625%) | 89,474 (+0.903%) | 87,231 | 87,231 | 88,673 |
+
+The parenthesized deltas are against libzstd. Dfast fails the every-armed-cell density bar on all four shapes. The level-8 row fails it on jsonreal, textreal and synthetic text; its synthetic json point is denser than the chain but loses 43.96% speed in a separate six-round position-alternating A/B (86.84 against 154.96 MiB/s median). Chain fails the bar on textreal and gives up 10.947% of output size on jsonreal to retain only a 0.053% byte lead over libzstd.
+
+Chain speed used six position-alternating rounds per arm under the exclusive benchmark lock, with two, two, four and 32 encodes per process on jsonreal, textreal, json and text respectively. Throughput is derived from median elapsed time, and the delta is chain against the shipped configuration:
+
+| Cell | shipped MiB/s | chain MiB/s | chain speed delta |
+|---|---:|---:|---:|
+| jsonreal | 200.94 | 196.02 | -2.45% |
+| textreal | 56.66 | 45.55 | -19.61% |
+| json | 156.00 | 155.15 | -0.55% |
+| text | 1726.81 | 1404.66 | -18.66% |
+
+Synthetic json already selects the chain, so its two arms are the same configuration and the residual is noise. Synthetic text reproduces the chain's identical bytes at a large speed loss. No lighter point buys speed while keeping every armed cell denser than libzstd; chain is slower on every real cell, and dfast and the level-8 row are density-vetoed. The Pareto therefore leaves the shipped frame-head verdict unchanged. No selection code landed, MT and stream behavior were not modified, and the landing-only ladders and suites were not run.
+
 ## Row matcher attempts tuning
 
 ### Per-block adaptive attempts budgets
@@ -283,6 +326,34 @@ Arm one was the faithful tag row, the diet form: the entry keeps the 24-bit bias
 Arm two was the wide-SIMD mask variant on the packed single line: a 64-byte row load, one `vpsrld`, one `vpcmpeqd` k-register compare per sixteen entries against the SSE2 chain's five uops per four, behind the shared SIMD clamp with the tier check cached once per process. Two findings close it. First, a tooling caveat that future wide-kernel probes must know: valgrind 3.27.1's CPUID emulation hides `avx512f` from the guest, so gungraun measured only the never-taken dispatch — a +1.3 to +2.0 percent Ir cost on every row cell, l5 json +1.31, l7 json +1.67, l11/l12 json +1.98, the twin cells +1.30 to +2.04 — the tier check plus the search body's re-roll around the new branch; gungraun cannot see an AVX-512 kernel at all. Second, the real-hardware read: perf stat instruction counts on solo `prof enc` loops, four iterations per cell, read textreal.l9 35.200G to 35.245G, +0.13 percent, jsonreal.l9 9.635G to 9.641G, +0.06, dll100.l9 42.008G to 41.731G, -0.66, json l7 15.82G to 15.69G, -0.81, json l11 40.61G to 39.66G, -2.33, with the json l9 chain control inside the ±0.2 percent noise band at -0.15. The two target twin cells sit at the noise band's center, no cut at all: a `target_feature` kernel cannot inline into the feature-less search body, so every search pays the argument setup, call and clobber beside the tier check, and against rowLog 4's one-chunk mask saving the twin's insert-heavy scan nets the pair to zero — the same famine boundary the asm-island probe recorded for the fast scan. The row band's cut is real but its center is the wide rows, not the twin.
 
 The residue worth keeping is the split by row width: both arms cut the rowLog 5 and 6 rows, l11 and l12 json reading -2.33 percent on real hardware and -4.92 under gungraun, where the SSE2 chain spans eight to sixteen chunk iterations and the per-sixteen-entries economy dominates the per-search dispatch overhead and the second-line store. The rowLog 4 half of the band — rows 5-8 and the balanced twin, the map's own target cells — pays the tag row outright and nets the wide mask to zero. Dead: reopening needs a hosting that serves rowLog 5 and 6 without a per-search call and without a second live table pointer — a scan-entry-level feature dispatch with the whole search body compiled per tier, the decode X2 pattern, behind its own probe — and a target-cell set that includes the wide rows rather than the rowLog 4 twin. Proposal 19's precondition, the u32 origin-carrying entries, stays unsatisfied; it was never priced standalone and stays its own row.
+
+### Extra tag bits in the row heads
+
+The R129 candidate kept the packed 24-bit position and original eight tag bits, widened each rowLog-4 insertion head from one byte to a u32, and stored one newly exposed hash bit per slot in that head word. This avoided the dedicated tag row's second pointer and insert store. Upfront filtering is not byte-identical: the five-byte-hash row can accept a four-byte collision, so the extra bit may differ on a selected match. The measured form therefore skipped an extra-bit mismatch only after a four-byte incumbent existed, when any improving match must share all five hash bytes. Shrinking the position field to fund a wider inline tag is also closed for the balanced twin: its 16 MiB reach already equals the 24-bit position period.
+
+Fresh whole-frame attribution on textreal.l9 read 8,762,870,944 Ir, with the row search closure and caller at 5,132,978,891 plus 2,745,423,259, 89.90 percent, so the registered 3 percent whole-cell threshold was 262.9M Ir. The corrected probe was byte-identical on textreal, jsonreal, text and json ST, but whole-frame Ir rose to 12,136,864,216 on textreal, +38.50 percent, and from 2,395,598,236 to 3,270,896,575 on jsonreal, +36.54 percent. Six locked, position-balanced interleaved rounds at two iterations per process read textreal 57 to 45 MiB/s, -21.05 percent, jsonreal 197 to 158, -19.80, synthetic text 1486.5 to 1412.5, -4.98, and the chain-selected json control 141.5 to 142.0, +0.35. The per-candidate mismatch bookkeeping and widened head-state traffic cost more than the post-incumbent verifies they remove. The probe was reverted; this layout family is closed without a candidate census showing that the skips can move to collection without dropping four-byte collision matches.
+
+### Row candidate census and collection filters
+
+The follow-up probe instrumented the stock row and chain searches over one full 32 MiB bulk-ST level-9 encode of textreal and jsonreal, then reverted the instrumentation without building a lever. It counted the candidates admitted by the existing tag mask, the verifies before and after the first incumbent, the actual extend lengths, and the candidates an extra hash bit or an initial four/five-byte screen could reject. The traffic census is:
+
+| Full-frame event | textreal.l9 | jsonreal.l9 |
+|---|---:|---:|
+| row searches | 10,594,411 | 2,498,084 |
+| tag-mask hits | 110,943,567 | 21,908,384 |
+| collected candidates | 107,487,652 | 20,954,288 |
+| empty / out-of-window rejects | 16,497 / 0 | 14,398 / 0 |
+| row inserts (head read-modify-writes) | 35,406,962 | 24,064,746 |
+| pre-incumbent verifies / extends | 9,497,938 / 9,376,356 | 1,984,604 / 1,899,868 |
+| post-incumbent verifies | 97,988,366 | 18,965,709 |
+| post-incumbent extends / improvements | 5,212,026 / 5,178,217 | 996,138 / 972,039 |
+| chain searches / link steps / linked inserts | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The post-incumbent extend lengths were 210, 1,818,838, 2,950,951, 355,394, 79,095 and 7,538 on textreal in the at-most-4, 5-7, 8-15, 16-31, 32-63 and 64-plus buckets; jsonreal read 498, 116,639, 243,726, 218,537, 352,865 and 63,873. Only 5.32 and 5.25 percent of post-incumbent verifies reach an extend, but 99.35 and 97.58 percent of those extends improve the incumbent. The beat check is therefore load-bearing: eager whole-scan verification would multiply extends by 18.8 and 19.0 times.
+
+The filter census kills both collection screens. The extra hash bit differs on zero pre-incumbent beat-pass candidates on textreal and four on jsonreal; all four jsonreal cases are selected four-byte matches, so upfront filtering is not byte-identical. After a four-byte incumbent, the bit could skip only 90 of textreal's 5,212,026 extends (0.0017 percent), with five matched bytes across them, and 287 of jsonreal's 996,138 (0.0288 percent), with zero matched bytes. An initial byte screen has no useful selectivity either: 107,107,285 of textreal's 107,487,652 collected candidates already match four bytes (99.646 percent), and 107,107,257 of those also match byte five. Only 258,771 post-incumbent candidates differ in the first four bytes; 210 reach an extend and their lengths total seven bytes. Jsonreal reads 20,652,199 four-byte passes (98.558 percent), 20,652,189 five-byte passes, 217,308 post-incumbent four-byte mismatches and 498 extends totaling two bytes.
+
+A layout-only candidate also fails the whole-cell price. Completely deleting the candidate array's one store and one reload per collected candidate removes at most 214,975,304 dynamic instructions on textreal, 2.453 percent of the 8,762,870,944-Ir cell against the 262.9M gate; jsonreal's ceiling is 41,908,576, 1.749 percent. A pipelined ring retains equivalent traffic and adds cursor bookkeeping, while deleting the collection pass and verifying inline is the dependent-load form already measured at json.l7 x2.0 in `row_search`'s layout record. With no chain traffic on either target, no chain-side residue offers a replacement. The registered collection filters and whole-scan layouts consequently have no candidate above 3 percent; no lever build, byte ladders, timing A/B or landing suites followed.
 
 ## Chain and lazy walks
 

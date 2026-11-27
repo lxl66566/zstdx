@@ -1,6 +1,6 @@
 # Testing
 
-This page maps the test suites, lists the gate commands, and records the flake, slow-test and fixture policies. The fuzz campaign itself has its own page in the fuzz crate (`crates/zstdx-fuzz/Readme.md`) and its workflow pitfalls in [workflow pitfalls](pitfalls/workflow.md).
+This page maps the test suites, lists the gate commands, and records the flake, slow-test and fixture policies. The fuzz campaign itself has its own page in the fuzz crate (`crates/zstdx-fuzz/Readme.md`) and its workflow pitfalls in [workflow pitfalls](pitfalls/workflow/fuzzing.md).
 
 ## Suite map
 

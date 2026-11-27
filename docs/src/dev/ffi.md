@@ -47,7 +47,7 @@ The parameters are `ZSTD_c_compressionLevel`, `ZSTD_c_windowLog`, `ZSTD_c_conten
 
 ### Estimates
 
-The `estimate*` family is a formula-exact port of the reference arithmetic: the cwksp sizing over the level rows, the row/chain match-finder layouts, the LDM tables and the streaming buffers, all returning byte-identical numbers to the reference build. Four reference object sizes are embedded as constants (`CCtx` 5280, `DCtx` 95976, `CDict` 6080, `DDict` 27352, probed from `libzstd.a` on this host), so the numbers are advisory budgets in the reference's units rather than reports of this implementation's allocations. The constants hold for the reference build `tests/run-c.sh` produces, the x86-64 baseline march; the target dependence behind that pin is recorded in [workflow pitfalls](pitfalls/workflow.md). The `initStatic*` family that would consume them is not exported.
+The `estimate*` family is a formula-exact port of the reference arithmetic: the cwksp sizing over the level rows, the row/chain match-finder layouts, the LDM tables and the streaming buffers, all returning byte-identical numbers to the reference build. Four reference object sizes are embedded as constants (`CCtx` 5280, `DCtx` 95976, `CDict` 6080, `DDict` 27352, probed from `libzstd.a` on this host), so the numbers are advisory budgets in the reference's units rather than reports of this implementation's allocations. The constants hold for the reference build `tests/run-c.sh` produces, the x86-64 baseline march; the target dependence behind that pin is recorded in [workflow pitfalls](pitfalls/workflow/toolchain.md). The `initStatic*` family that would consume them is not exported.
 
 ### Prefix references
 

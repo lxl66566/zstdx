@@ -5,7 +5,7 @@ description: Invariants and gates for the zstdx encoder hot paths. Read before e
 
 # zstdx encoder invariants
 
-Walk the contracts below before changing an encoding hot path. Every one comes from a real bug, with the full mechanism recorded in docs/src/dev/pitfalls/encoding.md. These are not theoretical rules.
+Walk the contracts below before changing an encoding hot path. Every one comes from a real bug, with the full mechanism recorded in docs/src/dev/pitfalls/encoding/memory-safety.md. These are not theoretical rules.
 
 ## Cursor and span arithmetic
 
@@ -44,6 +44,6 @@ Walk the contracts below before changing an encoding hot path. Every one comes f
 
 ## Further reading
 
-- docs/src/dev/pitfalls/encoding.md: the full mechanism behind each bug. Skim the Memory safety section before editing.
+- docs/src/dev/pitfalls/encoding/memory-safety.md: the full mechanism behind each bug, including the view and pooling contracts.
 - docs/src/dev/review/hardening.md: the coverage of each R69 wall layer and its known blind spots.
 - docs/src/dev/review/encparity.md: the root-cause chain of the three R68 bugs.

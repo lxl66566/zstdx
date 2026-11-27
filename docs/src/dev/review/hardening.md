@@ -58,7 +58,7 @@ Both bugs reproduced identically on the pre-hardening base, and both sat in the 
 
 A flush-regridded Growing-grid post could cross its epoch end. `post_ready` computed `end = job_start + epoch_size`, against a gate keyed on the epoch boundary, and a mid-epoch flush parks `job_start` where the two disagree. Release would freeze a view reading bytes that were never staged. `post_job`'s debug assert caught it under the walls.
 
-The mechanisms are recorded in [pitfalls/encoding](../pitfalls/encoding.md). The fixes are no-ops on untouched grids, and the dumps below are byte-identical.
+The mechanisms are recorded in [pitfalls/encoding](../pitfalls/encoding/memory-safety.md). The fixes are no-ops on untouched grids, and the dumps below are byte-identical.
 
 ## Gate numbers
 
