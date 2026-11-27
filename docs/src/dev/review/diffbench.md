@@ -1,6 +1,6 @@
 # Decode parity differential
 
-This page describes the `zstdx-bench parity` subcommand, which turns the craft-and-mutate differential from the [decode error paths](parity.md) review into a permanent tool. It answers what the tool compares, which mutation classes it runs, how it adjudicates a mismatch, and what the first full sweep found. The earlier harness lived in `/tmp`. This is its permanent form, recorded in the [todo list](../todo.md).
+This page describes the `zstdx-bench parity` subcommand, which turns the craft-and-mutate differential from the [decode error paths](parity.md) review into a permanent tool. It answers what the tool compares, which mutation classes it runs, how it adjudicates a mismatch, and what the first full sweep found. The earlier harness lived in `/tmp`. This is its permanent form.
 
 ## Design
 
@@ -22,7 +22,7 @@ Since the binding move to zstd-sys 2.2.0 (libzstd 1.6.0), the adjudicator keeps 
 
 ### Sweep control
 
-The full sweep is about 41k cases, each with one CLI spawn and N+1 zstdx decodes, and it runs in parallel. It must be wrapped in `flock -x /tmp/myflock.lock`. `--cases N` stride-samples deterministically. `--dict` attaches a dictionary to both decoders and encodes the seeds with it, and the dedicated dictionary-frame sweep is tracked in the [todo list](../todo.md). `--dump <dir>` writes the bytes of divergent cases for replay, and `--decode <file>` decodes one file with all verdicts printed.
+The full sweep is about 41k cases, each with one CLI spawn and N+1 zstdx decodes, and it runs in parallel. It must be wrapped in `flock -x /tmp/myflock.lock`. `--cases N` stride-samples deterministically. `--dict` attaches a dictionary to both decoders and encodes the seeds with it; the completed dictionary-frame sweep is recorded in [dictparity](dictparity.md). `--dump <dir>` writes the bytes of divergent cases for replay, and `--decode <file>` decodes one file with all verdicts printed.
 
 ## Bugs fixed
 

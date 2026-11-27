@@ -4,7 +4,7 @@ This page records three small decode-core follow-ups from the previous review ro
 
 ## Weight-table NCount alphabet cap
 
-The [todo list](../todo.md) asked for a weight-table alphabet cap. The earlier review note said libzstd caps the weight alphabet at 12 inside FSE_readNCount, and that number was off by one. `HUF_readStats`' FSE branch calls `FSE_decompress_wksp_bmi2(huffWeight, hwSize-1, ip+1, iSize, 6, ...)`. Every call site hands it a workspace of exactly `HUF_READ_STATS_WORKSPACE_SIZE_U32 = FSE_DECOMPRESS_WKSP_SIZE_U32(6, HUF_TABLELOG_MAX-1)`, sized for maxSymbolValue 11. The call sites are `HUF_readStats`' stack workspace and `HUF_readDTableX1/X2_wksp`'s `statsWksp` and `calleeWksp`.
+The entropy-core review asked for a weight-table alphabet cap. The earlier review note said libzstd caps the weight alphabet at 12 inside FSE_readNCount, and that number was off by one. `HUF_readStats`' FSE branch calls `FSE_decompress_wksp_bmi2(huffWeight, hwSize-1, ip+1, iSize, 6, ...)`. Every call site hands it a workspace of exactly `HUF_READ_STATS_WORKSPACE_SIZE_U32 = FSE_DECOMPRESS_WKSP_SIZE_U32(6, HUF_TABLELOG_MAX-1)`, sized for maxSymbolValue 11. The call sites are `HUF_readStats`' stack workspace and `HUF_readDTableX1/X2_wksp`'s `statsWksp` and `calleeWksp`.
 
 Inside `FSE_decompress_wksp_body`, `readNCount` writes the actual charnum minus 1 into `maxSVPtr`. The next line rejects `FSE_DECOMPRESS_WKSP_SIZE(tableLog, maxSV) > wkspSize` with `tableLog_tooLarge`. The formula is strictly increasing in maxSV above 11, because each extra symbol costs half a U32. A weights NCount with maxSV at most 11 is accepted, and maxSV at least 12 is rejected with `tableLog_tooLarge` regardless of what the bitstream emits.
 

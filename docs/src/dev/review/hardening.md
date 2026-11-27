@@ -82,7 +82,7 @@ Poison asserts fire at checkpoints, so a touch whose evidence is legitimately ov
 
 | Historical bug | Wall |
 |---|---|
-| reserve baseline, len against pos | writer-API consolidation, open in the [todo](../todo.md) |
+| reserve baseline, len against pos | writer-API consolidation, tracked as todograph item 45 |
 | HASH_READ tail lockstep and catch-up fill margin | poison, window past logical end |
 | insert_max underflow, `(end-p)&1` peel, rep-tail bars | IdxRange, empty-span floor |
 | dist-0 self-compare | wrapping-resolve helper, landed |

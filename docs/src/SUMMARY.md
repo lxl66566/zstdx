@@ -66,9 +66,8 @@
 - [R98 review: NT feed, owned source, stepped drain, mid-epoch staging](dev/review/r98-review.md)
 - [R100 MT/streaming machinery review](dev/review/r100-mt-review.md)
 
-## Remaining Improvements
+## Falsified Directions
 
-- [Remaining improvements](dev/todo.md)
 - [Falsified directions](dev/negative.md)
   - [Decoding](dev/negative/decoding.md)
   - [Encoding matchers](dev/negative/matchers.md)

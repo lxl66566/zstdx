@@ -66,7 +66,7 @@ Throughput is MiB/s at 1, 2, 4, 8 and 16 workers, and libzstd has no MT decode, 
 | random.zst3 | 9723 | 8780 | 9519 | 9625 | 9673 | 9099 |
 | dll100.zst3 | 1730 | 1628 | 2436 | 2886 | 3014 | 3131 |
 
-Json mt16 runs at 1.84 times the reference and 1.60 times its own single-thread, dll100 mt16 at 1.92 times the reference and 1.81 times its own, so the strongest single-frame rows hold. Skewed reads 1.80 times single-thread and 2.42 times the reference at mt8 against R111's 1.80 and 2.49, with mt16 at 1.78 and 2.40. Text stays flat at 0.97 and random at 0.94 to 0.99 times single-thread. This section's json st1 cell read 2009 against dec-st's 2100, a 4 percent draw of that solo cell. The remaining walls are sequence-read and aggregate-bandwidth bound, tracked as todo 1 in the [todo](../todo.md).
+Json mt16 runs at 1.84 times the reference and 1.60 times its own single-thread, dll100 mt16 at 1.92 times the reference and 1.81 times its own, so the strongest single-frame rows hold. Skewed reads 1.80 times single-thread and 2.42 times the reference at mt8 against R111's 1.80 and 2.49, with mt16 at 1.78 and 2.40. Text stays flat at 0.97 and random at 0.94 to 0.99 times single-thread. This section's json st1 cell read 2009 against dec-st's 2100, a 4 percent draw of that solo cell. The remaining walls are sequence-read and aggregate-bandwidth bound, tracked as todograph item 1 (`todograph show 1`).
 
 The real payloads run the same solo scaling section, and their denser frames give the segment-parallel decoder more work per staging span:
 
@@ -223,7 +223,7 @@ Exactly 12 zstdx-side cells moved against R111, all best-tier, from the store ga
 
 The same sweep over the two real shapes runs 48 cells and took 45.6 s. The geo-mean is **+1.79%**, reading jsonreal **+3.26%** and textreal **+0.34%**; by mode it reads bulk-st +2.30%, bulk-mt +1.55%, stream-st +2.38% and stream-mt +0.92%. The best row is the strongest tier at +8.06 to +8.51 percent by mode over the two shapes, +12.94 to +13.74 on jsonreal alone. The jsonreal.best.stream-mt cell reads 2,754,919 B at +13.51% against libzstd's 3,127,129, the cell the verdict fix restored from the strip-keyed 3,910,629.
 
-The recorded deficits sit in the MT modes and the balanced row's stream side. Jsonreal.balanced reads +11.01% bulk-st and +11.08% stream-st but +5.00% bulk-mt and +0.89% stream-mt on the plain-lattice jobs, and textreal.balanced reads +0.61% and +0.63% single-threaded but -0.27% bulk-mt and -2.30% stream-mt, the worst cell of the sweep and the un-ported stream-side storage substitution tracked as todo 42 in the [todo](../todo.md). The opt and ultra MT cells read behind their single-thread cells on both shapes: jsonreal.opt -1.81%, jsonreal.ultra -0.60%, textreal.opt -1.66% and textreal.ultra -1.23% at mt, against -0.25, -0.03, -0.73 and -0.01 single-threaded.
+The recorded deficits sit in the MT modes and the balanced row's stream side. Jsonreal.balanced reads +11.01% bulk-st and +11.08% stream-st but +5.00% bulk-mt and +0.89% stream-mt on the plain-lattice jobs, and textreal.balanced reads +0.61% and +0.63% single-threaded but -0.27% bulk-mt and -2.30% stream-mt, the worst cell of the sweep and the un-ported stream-side storage substitution tracked as todograph item 42. The opt and ultra MT cells read behind their single-thread cells on both shapes: jsonreal.opt -1.81%, jsonreal.ultra -0.60%, textreal.opt -1.66% and textreal.ultra -1.23% at mt, against -0.25, -0.03, -0.73 and -0.01 single-threaded.
 
 ## Full numeric ladder
 

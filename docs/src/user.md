@@ -111,7 +111,7 @@ Known deviations:
 - `read::{Encoder,Decoder}` take `R: Read` directly and wrap it in no `BufReader`, so `get_ref` and `finish` expose `R`.
 - `bulk::Decompressor::decompress` treats `capacity` as a growing hint, where the zstd crate errors.
 - A prepared dictionary that fails to parse replays the error at use, where the zstd crate panics.
-- `set_target_cblock_size` stays unimplemented, because sub-block splitting is falsified for ratio, as recorded in the [todo list](dev/todo.md).
+- `set_target_cblock_size` stays unimplemented, because sub-block splitting is falsified for ratio, as recorded in [falsified directions](dev/negative/entropy.md).
 
 `long_distance_matching(bool)` maps onto `EncoderOptions::long_distance_matching`. A value of true forces the far-match source on with libzstd's window-27 default when no window is forced. A value of false restores the automatic per-level arming, because the upstream bool cannot express an explicit disable. `with_ref_prefix` is the raw-dictionary path under libzstd's prefix name. A refPrefix loads raw content, which brings no entropy tables, no dictionary id and format-default repcodes.
 

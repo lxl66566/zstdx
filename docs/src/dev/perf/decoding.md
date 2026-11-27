@@ -1,6 +1,6 @@
 # Decoding Path
 
-This page answers where decode time goes, how the output and executor paths are structured, and which residual gaps remain. It is organized by decode stage, with the fused sequence loop first and parallel decode last. Disproven directions live in the [Disproven Directions](../negative.md) page, and the per-stage falsification data is in [negative.md](../negative/decoding.md). Open work is in the [Todo List](../todo.md).
+This page answers where decode time goes, how the output and executor paths are structured, and which residual gaps remain. It is organized by decode stage, with the fused sequence loop first and parallel decode last. Disproven directions live in the [Disproven Directions](../negative.md) page, and the per-stage falsification data is in [negative.md](../negative/decoding.md). Open work is tracked in `.agents/todograph/` and read through `todograph graph`.
 
 ## Output path
 

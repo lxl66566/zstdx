@@ -4,7 +4,7 @@ zstdx is this repository's pure-Rust zstd implementation. It started as a fork o
 
 The comparison answers where the design departs from the reference, what zstdx adds, and what it still lacks. It covers four domains: encoder front-end, entropy coding, decoder, and systems architecture. Citations name a symbol in `crates/zstdx/src/...` against its counterpart in `lib/...`.
 
-The page records design-level reasoning and a symbol-level index across both trees, and it is re-verified against both trees on major changes rather than kept as a dated snapshot. The authoritative current capability and gap state lives in [status](status.md) and [todo](todo.md).
+The page records design-level reasoning and a symbol-level index across both trees, and it is re-verified against both trees on major changes rather than kept as a dated snapshot. The authoritative capability state lives in [status](status.md). Open work is tracked in `.agents/todograph/` and read through `todograph graph`.
 
 ## Reading this page
 
